@@ -98,6 +98,12 @@ function load() {
   state.settings = Object.assign({}, DEFAULT_SETTINGS, state.settings || {});
   state.settings.sso = Object.assign({}, DEFAULT_SETTINGS.sso, state.settings.sso || {});
 
+  // One admin is the main owner: only they can change their own account
+  if (!state.users.some((u) => u.isOwner)) {
+    const first = state.users.filter((u) => u.isAdmin).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0))[0];
+    if (first) first.isOwner = true;
+  }
+
   // Every site has an owner. Sites from before ownership existed (or whose owner
   // was removed) belong to the first admin.
   const firstAdmin = state.users.find((u) => u.isAdmin && !u.disabled) || state.users.find((u) => u.isAdmin);

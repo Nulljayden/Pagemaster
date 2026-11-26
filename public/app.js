@@ -29,6 +29,12 @@
   }
 
   function can(p) { return state.user && (state.user.isAdmin || state.user.permissions.includes(p)); }
+  function roleLabel(u) {
+    if (u.isOwner) return 'Main owner';
+    if (u.isAdmin) return 'Administrator';
+    if (u.isLimitedAdmin) return 'Limited admin';
+    return u.source === 'sso' ? 'SSO user' : 'User';
+  }
   function pageVisible(p) { return !p.perm || can(p.perm) || !!(p.alt && p.alt()); }
   async function directory() {
     if (!state.directory) state.directory = await api('GET', '/api/users/directory');
@@ -67,6 +73,21 @@
         },
       });
     });
+  }
+
+  function copyText(text, msg = 'Copied') {
+    const done = () => toast(msg, 'ok');
+    if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text).then(done, () => fallback());
+    fallback();
+    function fallback() {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.cssText = 'position:fixed;opacity:0';
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); done(); } catch (_) { toast('Copy failed', 'error'); }
+      ta.remove();
+    }
   }
 
   function fmtTime(ts) { return ts ? new Date(ts).toLocaleString() : '—'; }
@@ -133,6 +154,7 @@
   const PAGES = [
     { id: 'sites', label: 'Sites', icon: '🌐', perm: 'sites.view', alt: () => state.siteAccess.view || can('sites.manage') },
     { id: 'files', label: 'Files', icon: '📁', perm: 'files.read', alt: () => state.siteAccess.files },
+    { id: 'passwords', label: 'Passwords', icon: '🔑', perm: '-', alt: () => state.siteAccess.passwords },
     { id: 'terminal', label: 'Terminal', icon: '⌨️', perm: 'terminal' },
     { id: 'tunnels', label: 'Tunnels', icon: '☁️', perm: 'tunnels.manage' },
     { id: 'credentials', label: 'Git Credentials', icon: '🔑', perm: 'credentials.manage' },
@@ -177,7 +199,7 @@
           <div class="spacer"></div>
           <div class="userbox">
             <strong>${esc(u.displayName || u.username)}</strong>
-            ${u.isAdmin ? 'Administrator' : (u.source === 'sso' ? 'SSO user' : 'User')}
+            ${roleLabel(u)}
             <div style="margin-top:8px"><button class="btn sm" id="logout">Sign out</button></div>
             <div class="small" style="margin-top:10px" title="Pagemaster version and image build">v${esc(state.system.version)} · build ${esc(state.system.build)}</div>
           </div>
@@ -196,7 +218,7 @@
     $$('.nav a').forEach((a) => a.classList.toggle('active', a.dataset.page === page));
     const el = $('#page');
     el.innerHTML = '';
-    ({ sites: pageSites, files: pageFiles, terminal: pageTerminal, tunnels: pageTunnels, credentials: pageCredentials, users: pageUsers, settings: pageSettings, account: pageAccount })[page](el);
+    ({ sites: pageSites, files: pageFiles, passwords: pagePasswords, terminal: pageTerminal, tunnels: pageTunnels, credentials: pageCredentials, users: pageUsers, settings: pageSettings, account: pageAccount })[page](el);
   }
 
   function passwordPrompt() {
@@ -268,14 +290,64 @@
       </div>
       ${sys.storage && !sys.storage.ok ? `<div class="alert error"><b>Storage problem:</b> the /data volume can't run programs, so sites with install/build commands or App sites will fail (npm "Permission denied", exit code 126).<br>
         ${esc(sys.storage.problem)}<br><br>${esc(sys.storage.fix)}</div>` : ''}
+      <div class="filters">
+        <input type="search" id="f-q" placeholder="Search sites" value="${esc(siteFilter().q)}">
+        <select id="f-owner" aria-label="Owner"></select>
+        <select id="f-status" aria-label="Status">${[['', 'Any status'], ['live', 'Live'], ['deploying', 'Deploying'], ['error', 'Error'], ['stopped', 'Stopped'], ['waiting', 'Waiting'], ['private', 'Private websites'], ['public', 'Public websites']]
+          .map(([v, l]) => `<option value="${v}" ${siteFilter().status === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
+      </div>
       <div id="site-list" class="sites"><div class="muted">Loading…</div></div>`;
     if ($('#add-site')) $('#add-site').onclick = () => siteForm();
+    const onFilter = () => {
+      saveSiteFilter({ q: $('#f-q').value, owner: $('#f-owner').value, status: $('#f-status').value });
+      const box = $('#site-list');
+      if (box && box._all) renderSiteList(box._all);
+    };
+    $('#f-q').oninput = onFilter;
+    $('#f-owner').onchange = onFilter;
+    $('#f-status').onchange = onFilter;
     const load = async () => {
       if (state.page !== 'sites') return;
       try { renderSiteList(await api('GET', '/api/sites')); } catch (e) { /* ignore poll errors */ }
     };
     await load();
     state.timer = setInterval(load, 4000);
+  }
+
+  // Sites page filter: owner defaults to the signed-in user. Kept for this browser tab.
+  function siteFilter() {
+    let f = {};
+    try { f = JSON.parse(sessionStorage.getItem('pm-site-filter') || '{}'); } catch (_) {}
+    return { q: f.q || '', owner: f.owner || 'me', status: f.status || '' };
+  }
+  function saveSiteFilter(f) { try { sessionStorage.setItem('pm-site-filter', JSON.stringify(f)); } catch (_) {} }
+
+  function applySiteFilter(list) {
+    const f = siteFilter();
+    const q = f.q.trim().toLowerCase();
+    const me = state.user.id;
+    return list.filter((s) => {
+      if (f.owner === 'me' && s.ownerId !== me) return false;
+      if (f.owner === 'others' && s.ownerId === me) return false;
+      if (!['me', 'all', 'others'].includes(f.owner) && s.ownerId !== f.owner) return false;
+      const st = s.deploying ? 'deploying' : (s.status || 'pending');
+      if (['private', 'public'].includes(f.status) ? s.access !== f.status : (f.status && st !== f.status)) return false;
+      if (q && ![s.name, s.slug, s.repoUrl, s.ownerName, ...(s.domains || []), ...(s.tunnelHosts || []).map((t) => t.hostname)].some((x) => String(x || '').toLowerCase().includes(q))) return false;
+      return true;
+    });
+  }
+
+  function fillOwnerFilter(list) {
+    const sel = $('#f-owner');
+    if (!sel) return;
+    const f = siteFilter();
+    const owners = new Map();
+    for (const s of list) if (s.ownerId !== state.user.id) owners.set(s.ownerId, s.ownerName);
+    const opts = [['me', 'My sites'], ['all', 'All sites'], ['others', 'Other people\'s']]
+      .concat([...owners].sort((a, b) => a[1].localeCompare(b[1])).map(([id, n]) => [id, `Owner: ${n}`]));
+    if (!opts.some(([v]) => v === f.owner)) opts.push([f.owner, 'Owner: (none)']);
+    const html = opts.map(([v, l]) => `<option value="${esc(v)}" ${v === f.owner ? 'selected' : ''}>${esc(l)}</option>`).join('');
+    if (sel._html !== html) { sel.innerHTML = html; sel._html = html; }
   }
 
   function siteInfoHtml(s) {
@@ -305,14 +377,9 @@
           ${s.status === 'waiting' ? `<div class="small">Waiting for the deploy key to be added to the repository.${my.manage ? ' <a href="#" data-act="deploykey">Show the key</a>' : ''}</div>` : ''}
         </div>
         <div class="row site-actions">
-          <button class="btn sm" data-act="preview">👁 Preview</button>
-          <button class="btn sm" data-act="analytics">📊 Analytics</button>
-          ${can('tunnels.manage') && my.manage ? '<button class="btn sm" data-act="publish">☁ Publish</button>' : ''}
-          ${my.deploy ? `<button class="btn sm" data-act="deploy">⟳ Pull &amp; deploy</button>
-            ${s.enabled === false ? '<button class="btn sm" data-act="start">▶ Start</button>' : '<button class="btn sm" data-act="stop">■ Stop</button>'}` : ''}
-          <button class="btn sm" data-act="log">Logs</button>
-          ${my['files.read'] ? '<button class="btn sm" data-act="files">Files</button>' : ''}
-          ${my.manage || my.share || my.transfer ? '<button class="btn sm" data-act="settings">⚙ Settings</button>' : ''}
+          <button class="btn sm" data-act="menu" aria-haspopup="menu">☰ Options</button>
+          ${s.notes && s.notes.text ? '<a href="#" class="small" data-act="notes">📝 Notes</a>' : ''}
+          ${s.vaultCount && my['passwords.view'] ? `<a href="#" class="small" data-act="passwords">🔑 ${s.vaultCount} password${s.vaultCount === 1 ? '' : 's'}</a>` : ''}
         </div>`;
   }
 
@@ -326,12 +393,24 @@
       sandbox="allow-scripts allow-same-origin allow-forms" title="Preview of ${esc(s.name)}"></iframe>`;
   }
 
-  function renderSiteList(list) {
+  function renderSiteList(all) {
     const box = $('#site-list');
     if (!box) return;
-    box._sites = list;
+    box._all = all;
+    box._sites = all;
+    fillOwnerFilter(all);
+    const list = applySiteFilter(all);
     if (!list.length) {
-      box.innerHTML = `<div class="card empty">${can('sites.manage') ? 'No sites yet. Click <b>+ Add site</b> to deploy a repository.' : 'No sites have been shared with you yet.'}</div>`;
+      const f = siteFilter();
+      box.innerHTML = all.length
+        ? `<div class="card empty">${f.owner === 'me' && !f.q && !f.status ? 'You don\'t own any sites.' : 'No sites match.'} <a href="#" id="f-all">Show all ${all.length} site${all.length === 1 ? '' : 's'}</a></div>`
+        : `<div class="card empty">${can('sites.manage') ? 'No sites yet. Click <b>+ Add site</b> to deploy a repository.' : 'No sites have been shared with you yet.'}</div>`;
+      if ($('#f-all')) $('#f-all').onclick = (e) => {
+        e.preventDefault();
+        saveSiteFilter({ q: '', owner: 'all', status: '' });
+        $('#f-q').value = ''; $('#f-status').value = '';
+        renderSiteList(all);
+      };
       return;
     }
     if (!box.querySelector('.site')) box.innerHTML = '';
@@ -354,11 +433,92 @@
       }
       $('.site-info', card).innerHTML = siteInfoHtml(s);
       $$('[data-act]', card).forEach((b) => {
-        b.onclick = (e) => { e.preventDefault(); siteAction(b.dataset.act, box._sites.find((x) => x.id === s.id)); };
+        b.onclick = (e) => {
+          e.preventDefault();
+          const cur = box._sites.find((x) => x.id === s.id);
+          if (b.dataset.act === 'menu') siteMenu(cur, b);
+          else siteAction(b.dataset.act, cur);
+        };
       });
     });
     $$('.site', box).forEach((c) => { if (!seen.has(c.dataset.id)) box.removeChild(c); });
   }
+
+  // Every site option in one menu, opened from the card's Options button
+  function siteMenu(s, anchor) {
+    closeMenu();
+    const my = s.my || {};
+    const groups = [
+      ['Open', [
+        ['preview', '👁 Preview', true],
+        ['open', '↗ Open site', true],
+        ['analytics', '📊 Analytics', true],
+        ['log', '📄 Logs', true],
+        ['notes', '📝 Notes', true],
+        ['passwords', '🔑 Passwords', my['passwords.view']],
+        ['files', '📁 Files', my['files.read']],
+      ]],
+      ['Run', [
+        ['deploy', '⟳ Pull & deploy', my.deploy],
+        [s.enabled === false ? 'start' : 'stop', s.enabled === false ? '▶ Start' : '■ Stop', my.deploy],
+        ['publish', '☁ Publish on a domain', can('tunnels.manage') && my.manage],
+      ]],
+      ['Settings', [
+        ['edit', '✎ Edit site', my.manage],
+        ['visibility', `🔒 Visibility <span class="muted">· ${s.access === 'private' ? 'private' : 'public'}</span>`, my.manage],
+        ['addresses', '🔗 Primary address', my.manage],
+        ['deploykey', '🗝 Deploy key', my.manage],
+        ['webhook', '🪝 Deploy webhook', my.manage],
+      ]],
+      ['Access', [
+        ['share', '👥 Sharing', my.share],
+        ['transfer', '⇄ Transfer ownership', my.transfer],
+        ['delete', '🗑 Delete site', my.share, 'danger'],
+      ]],
+    ];
+    const menu = document.createElement('div');
+    menu.className = 'menu';
+    menu.setAttribute('role', 'menu');
+    menu.innerHTML = `<div class="menu-head"><b>${esc(s.name)}</b><span class="muted small">Owner: ${esc(s.ownerName)}</span></div>` +
+      groups.map(([title, items]) => {
+        const shown = items.filter((x) => x[2]);
+        return shown.length ? `<div class="menu-group"><div class="menu-title">${title}</div>${shown.map(([act, label, , cls]) =>
+          `<button role="menuitem" class="menu-item ${cls || ''}" data-act="${act}">${label}</button>`).join('')}</div>` : '';
+      }).join('');
+    document.body.appendChild(menu);
+    const r = anchor.getBoundingClientRect();
+    const w = menu.offsetWidth;
+    const h = menu.offsetHeight;
+    menu.style.left = Math.max(8, Math.min(r.left, window.innerWidth - w - 8)) + 'px';
+    menu.style.top = (r.bottom + 4 + h > window.innerHeight && r.top - 4 - h > 0 ? r.top - 4 - h : Math.min(r.bottom + 4, window.innerHeight - h - 8)) + 'px';
+    $$('[data-act]', menu).forEach((b) => {
+      b.onclick = () => {
+        closeMenu();
+        if (b.dataset.act === 'open') window.open(siteUrls(s)[0].url, '_blank', 'noopener');
+        else siteAction(b.dataset.act, s);
+      };
+    });
+    const first = $('.menu-item', menu);
+    if (first) first.focus();
+    menu.addEventListener('keydown', (e) => {
+      const items = $$('.menu-item', menu);
+      const i = items.indexOf(document.activeElement);
+      if (e.key === 'ArrowDown') { e.preventDefault(); items[(i + 1) % items.length].focus(); }
+      if (e.key === 'ArrowUp') { e.preventDefault(); items[(i - 1 + items.length) % items.length].focus(); }
+    });
+    state.menu = { el: menu, anchor };
+    setTimeout(() => document.addEventListener('mousedown', menuOutside), 0);
+  }
+  function menuOutside(e) { if (state.menu && !state.menu.el.contains(e.target)) closeMenu(); }
+  function closeMenu() {
+    if (!state.menu) return;
+    state.menu.el.remove();
+    state.menu = null;
+    document.removeEventListener('mousedown', menuOutside);
+  }
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeMenu(); });
+  window.addEventListener('resize', closeMenu);
+  window.addEventListener('scroll', closeMenu, true);
 
   function showPreview(s) {
     const first = previewUrl(s);
@@ -402,7 +562,8 @@
       if (act === 'files') { state.filesPath = '/' + s.slug; go('files'); return; }
       if (act === 'webhook') showWebhook(s);
       if (act === 'analytics') { showAnalytics(s); return; }
-      if (act === 'settings') { siteSettings(s); return; }
+      if (act === 'notes') { notesModal(s); return; }
+      if (act === 'passwords') { vaultModal(s); return; }
       if (act === 'addresses') { addressesForm(s); return; }
       if (act === 'visibility') { visibilityForm(s); return; }
       if (act === 'deploykey') { deployKeyModal(s); return; }
@@ -417,22 +578,37 @@
     } catch (e) { toast(e.message, 'error'); }
   }
 
-  function showLog(s) {
-    const m = modal(`<div class="row"><h2 class="grow" style="margin:0">Logs — ${esc(s.name)}</h2>
+  // Live log window. The text is only touched when new output arrives, so
+  // scrolling and selecting text aren't disturbed by the refresh.
+  function logViewer({ title, url, clearUrl, canClear }) {
+    const m = modal(`<div class="row"><h2 class="grow" style="margin:0">${title}</h2>
       <label class="check small"><input type="checkbox" id="follow" checked> Follow</label>
+      ${canClear ? '<button class="btn sm danger" id="log-clear">Clear logs</button>' : ''}
       <button class="btn sm" data-close>Close</button></div>
       <pre class="logbox mono" id="logbox" style="margin-top:12px">Loading…</pre>`, { wide: true });
+    let last = null;
     const load = async () => {
       if (!document.body.contains(m.el)) return clearInterval(t);
       try {
-        const txt = await api('GET', `/api/sites/${s.id}/log`);
+        const txt = await api('GET', url);
+        if (txt === last) return;
         const box = $('#logbox', m.el);
-        box.textContent = txt || '(no log output yet)';
+        if (last && txt.startsWith(last)) box.appendChild(document.createTextNode(txt.slice(last.length)));
+        else box.textContent = txt || '(no log output yet)';
+        last = txt;
         if ($('#follow', m.el).checked) box.scrollTop = box.scrollHeight;
       } catch (_) {}
     };
+    if ($('#log-clear', m.el)) $('#log-clear', m.el).onclick = async () => {
+      if (!(await confirmBox('Clear the log? The current output is deleted.', 'Clear'))) return;
+      try { await api('DELETE', clearUrl); last = null; load(); toast('Log cleared', 'ok'); } catch (e) { toast(e.message, 'error'); }
+    };
     const t = setInterval(load, 2000);
     load();
+  }
+
+  function showLog(s) {
+    logViewer({ title: `Logs — ${esc(s.name)}`, url: `/api/sites/${s.id}/log`, clearUrl: `/api/sites/${s.id}/log`, canClear: !!(s.my && s.my.deploy) });
   }
 
   function showWebhook(s) {
@@ -441,7 +617,7 @@
       <input type="text" readonly value="${esc(s.webhookUrl)}" id="wh" class="mono">
       <div class="modal-foot"><button class="btn danger" id="rotate">Regenerate secret</button><button class="btn" id="copy">Copy</button><button class="btn primary" data-close>Done</button></div>`, {
       onMount: (m, close) => {
-        $('#copy', m).onclick = () => { navigator.clipboard.writeText($('#wh', m).value).then(() => toast('Copied', 'ok')); };
+        $('#copy', m).onclick = () => { copyText($('#wh', m).value); };
         $('#rotate', m).onclick = async () => {
           const r = await api('POST', `/api/sites/${s.id}/webhook/rotate`);
           $('#wh', m).value = r.webhookUrl;
@@ -455,27 +631,159 @@
     if (state.page === 'sites') renderSiteList(await api('GET', '/api/sites'));
   }
 
-  // One place for everything that changes a site's setup
-  function siteSettings(s) {
-    const my = s.my || {};
-    const item = (act, title, text, cls = '') => `<button class="btn block settings-item ${cls}" data-go="${act}"><b>${title}</b><span class="muted small">${text}</span></button>`;
-    modal(`<h2>${esc(s.name)}: settings</h2>
-      <p class="muted small" style="margin-top:0">Owner: <b>${esc(s.ownerName)}</b>${my.owner ? ' (you)' : ''}</p>
-      <div class="settings-list">
-        ${my.manage ? item('edit', 'Edit site', 'Repository, build and start commands, custom domains, port. Saving redeploys.') : ''}
-        ${my.manage ? item('addresses', 'Primary address', 'Choose which URL is the main one, and optionally redirect the others to it.') : ''}
-        ${my.manage ? item('visibility', 'Visibility', `Website: <b>${s.access === 'private' ? 'private' : 'public'}</b> · In Pagemaster: <b>${s.panelVisibility === 'public' ? 'all users' : 'private'}</b>`) : ''}
-        ${my.manage ? item('deploykey', 'Deploy key', 'This site\'s own SSH key, to add as a read-only deploy key on the repository.') : ''}
-        ${my.manage ? item('webhook', 'Deploy webhook', 'URL your git host calls on every push.') : ''}
-        ${my.share ? item('share', 'Sharing', 'Give other users access to just this site.') : ''}
-        ${my.transfer ? item('transfer', 'Transfer ownership', 'Hand the site to another user.') : ''}
-        ${my.share ? item('delete', 'Delete site', 'Removes the site, its files and analytics.', 'danger') : ''}
-      </div>
-      <div class="modal-foot"><button class="btn" data-close>Close</button></div>`, {
+  // ------------------------------------------------------------------ notes
+  function linkify(text) {
+    return esc(text).replace(/\bhttps?:\/\/[^\s<]+[^\s<.,;:!?)\]'"]/g, (u) => `<a href="${u}" target="_blank" rel="noopener">${u}</a>`);
+  }
+
+  function notesModal(s) {
+    const n = s.notes || {};
+    const canEdit = !!(s.my && s.my['notes.edit']);
+    modal(`<div class="row"><h2 class="grow" style="margin:0">Notes — ${esc(s.name)}</h2>
+        ${canEdit ? '<button class="btn sm" id="n-edit">Edit</button>' : ''}<button class="btn sm" data-close>Close</button></div>
+      <p class="muted small">${n.updatedAt ? `Last changed by <b>${esc(n.updatedBy)}</b>, ${fmtTime(n.updatedAt)}` : 'Shared notes for everyone who can see this site.'}</p>
+      <div id="n-view" class="notes">${n.text ? linkify(n.text) : '<span class="muted">No notes yet.</span>'}</div>
+      <form id="n-form" hidden>
+        <textarea name="text" rows="16" class="mono" placeholder="Anything worth knowing about this site: who to call, how it's set up, to-dos…">${esc(n.text || '')}</textarea>
+        <div class="modal-foot"><button type="button" class="btn" id="n-cancel">Cancel</button><button class="btn primary">Save notes</button></div>
+      </form>`, {
+      wide: true,
       onMount: (m, close) => {
-        $$('[data-go]', m).forEach((b) => { b.onclick = () => { close(); siteAction(b.dataset.go, s); }; });
+        const edit = (on) => { $('#n-form', m).hidden = !on; $('#n-view', m).hidden = on; if ($('#n-edit', m)) $('#n-edit', m).hidden = on; if (on) $('textarea', m).focus(); };
+        if ($('#n-edit', m)) $('#n-edit', m).onclick = () => edit(true);
+        $('#n-cancel', m).onclick = () => edit(false);
+        $('#n-form', m).onsubmit = async (e) => {
+          e.preventDefault();
+          try { await api('PUT', `/api/sites/${s.id}/notes`, { text: $('textarea', m).value }); toast('Notes saved', 'ok'); close(); refreshSites(); }
+          catch (ex) { toast(ex.message, 'error'); }
+        };
       },
     });
+  }
+
+  // ------------------------------------------------------------------ passwords
+  function genPassword(len = 20) {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*-_=+';
+    const out = [];
+    const buf = new Uint32Array(len);
+    crypto.getRandomValues(buf);
+    for (const n of buf) out.push(chars[n % chars.length]);
+    return out.join('');
+  }
+
+  async function revealPassword(siteId, eid) {
+    return (await api('POST', `/api/sites/${siteId}/vault/${eid}/reveal`)).password;
+  }
+
+  function vaultRows(siteId, entries, canEdit) {
+    if (!entries.length) return '<div class="empty">No passwords saved yet.</div>';
+    return `<table class="vault"><thead><tr><th>Name</th><th>Username</th><th>Password</th><th></th></tr></thead><tbody>
+      ${entries.map((e) => `<tr data-site="${esc(siteId)}" data-eid="${esc(e.id)}">
+        <td><b>${e.url ? `<a href="${esc(/^https?:\/\//.test(e.url) ? e.url : 'https://' + e.url)}" target="_blank" rel="noopener">${esc(e.title)}</a>` : esc(e.title)}</b>
+          ${e.notes ? `<div class="muted small">${esc(e.notes)}</div>` : ''}<div class="muted small">${esc(e.updatedBy || '')} · ${fmtTime(e.updatedAt)}</div></td>
+        <td>${e.username ? `<span class="mono">${esc(e.username)}</span> <button class="btn sm" data-v="cu" title="Copy username">⧉</button>` : '<span class="muted">—</span>'}</td>
+        <td>${e.hasPassword ? `<span class="mono pw">••••••••</span> <button class="btn sm" data-v="show">Show</button><button class="btn sm" data-v="cp">Copy</button>` : '<span class="muted">—</span>'}</td>
+        <td style="text-align:right;white-space:nowrap">${canEdit ? '<button class="btn sm" data-v="edit">Edit</button><button class="btn sm danger" data-v="rm">Delete</button>' : ''}</td>
+      </tr>`).join('')}</tbody></table>`;
+  }
+
+  function bindVaultRows(root, entriesBySite, reload) {
+    $$('tr[data-eid]', root).forEach((tr) => {
+      const sid = tr.dataset.site;
+      const e = entriesBySite[sid].find((x) => x.id === tr.dataset.eid);
+      $$('[data-v]', tr).forEach((b) => { b.onclick = async () => {
+        try {
+          if (b.dataset.v === 'cu') copyText(e.username, 'Username copied');
+          if (b.dataset.v === 'cp') copyText(await revealPassword(sid, e.id), 'Password copied');
+          if (b.dataset.v === 'show') {
+            const span = $('.pw', tr);
+            if (b.textContent === 'Hide') { span.textContent = '••••••••'; b.textContent = 'Show'; return; }
+            span.textContent = await revealPassword(sid, e.id);
+            b.textContent = 'Hide';
+          }
+          if (b.dataset.v === 'edit') vaultForm(sid, e, reload);
+          if (b.dataset.v === 'rm') {
+            if (!(await confirmBox(`Delete the saved password "${e.title}"?`))) return;
+            await api('DELETE', `/api/sites/${sid}/vault/${e.id}`);
+            reload();
+          }
+        } catch (ex) { toast(ex.message, 'error'); }
+      }; });
+    });
+  }
+
+  function vaultForm(siteId, e, onSaved) {
+    const editing = !!e;
+    e = e || {};
+    modal(`<h2>${editing ? 'Edit' : 'Add'} password</h2>
+      <form id="v-form">
+        <label class="field"><span>Name</span><input type="text" name="title" value="${esc(e.title)}" required maxlength="120" placeholder="e.g. WordPress admin, Database, Hosting panel"></label>
+        <div class="grid2">
+          <label class="field"><span>Username</span><input type="text" name="username" value="${esc(e.username)}" autocomplete="off"></label>
+          <label class="field"><span>Password</span><div class="row"><input type="password" name="password" class="grow mono" style="width:auto" autocomplete="new-password" placeholder="${editing && e.hasPassword ? 'leave blank to keep' : ''}"><button type="button" class="btn" id="v-gen" title="Generate a strong password">Generate</button><button type="button" class="btn" id="v-eye" title="Show">👁</button></div></label>
+        </div>
+        <label class="field"><span>Address</span><input type="text" name="url" value="${esc(e.url)}" placeholder="https://example.com/wp-admin"></label>
+        <label class="field"><span>Notes</span><textarea name="notes" rows="2">${esc(e.notes)}</textarea></label>
+        <div class="modal-foot"><button type="button" class="btn" data-close>Cancel</button><button class="btn primary">Save</button></div>
+      </form>`, {
+      onMount: (m, close) => {
+        const pw = $('[name=password]', m);
+        $('#v-gen', m).onclick = () => { pw.value = genPassword(); pw.type = 'text'; };
+        $('#v-eye', m).onclick = () => { pw.type = pw.type === 'password' ? 'text' : 'password'; };
+        $('#v-form', m).onsubmit = async (ev) => {
+          ev.preventDefault();
+          const body = formData(ev.target);
+          if (editing && !body.password) delete body.password;
+          try {
+            if (editing) await api('PUT', `/api/sites/${siteId}/vault/${e.id}`, body);
+            else await api('POST', `/api/sites/${siteId}/vault`, body);
+            toast('Saved', 'ok');
+            close();
+            onSaved();
+          } catch (ex) { toast(ex.message, 'error'); }
+        };
+      },
+    });
+  }
+
+  function vaultModal(s) {
+    const m = modal(`<div class="row"><h2 class="grow" style="margin:0">Passwords — ${esc(s.name)}</h2>
+        <button class="btn sm primary" id="v-add" hidden>+ Add password</button><button class="btn sm" data-close>Close</button></div>
+      <p class="muted small">Saved logins for this site, shared with the people who have password access to it. Stored encrypted.</p>
+      <div id="v-list">Loading…</div>`, { wide: true });
+    const load = async () => {
+      try {
+        const r = await api('GET', `/api/sites/${s.id}/vault`);
+        $('#v-add', m.el).hidden = !r.canEdit;
+        $('#v-list', m.el).innerHTML = vaultRows(s.id, r.entries, r.canEdit);
+        bindVaultRows($('#v-list', m.el), { [s.id]: r.entries }, load);
+        refreshSites();
+      } catch (e) { toast(e.message, 'error'); }
+    };
+    $('#v-add', m.el).onclick = () => vaultForm(s.id, null, load);
+    load();
+  }
+
+  async function pagePasswords(el) {
+    el.innerHTML = `<div class="page-head"><div><h1>Passwords</h1><p>Saved logins of the sites you have password access to.</p></div></div>
+      <div class="filters"><input type="search" id="pw-q" placeholder="Search passwords"></div>
+      <div id="pw-list"><div class="muted">Loading…</div></div>`;
+    let data = [];
+    const draw = () => {
+      const q = $('#pw-q').value.trim().toLowerCase();
+      const groups = data.map((g) => ({ ...g, entries: g.entries.filter((e) => !q || [g.siteName, e.title, e.username, e.url, e.notes].some((x) => String(x || '').toLowerCase().includes(q))) }))
+        .filter((g) => g.entries.length || (!q && g.canEdit));
+      $('#pw-list').innerHTML = groups.length ? groups.map((g) => `<div class="card" data-site="${esc(g.siteId)}">
+          <div class="row"><h3 class="grow" style="margin:0">${esc(g.siteName)}</h3>${g.canEdit ? '<button class="btn sm" data-add>+ Add</button>' : ''}</div>
+          ${vaultRows(g.siteId, g.entries, g.canEdit)}</div>`).join('')
+        : `<div class="card empty">${q ? 'Nothing matches.' : 'No passwords you can see yet. Add them from a site\'s ☰ Options → Passwords.'}</div>`;
+      const bySite = Object.fromEntries(data.map((g) => [g.siteId, g.entries]));
+      bindVaultRows($('#pw-list'), bySite, load);
+      $$('#pw-list [data-add]').forEach((b) => { b.onclick = () => vaultForm(b.closest('[data-site]').dataset.site, null, load); });
+    };
+    const load = async () => { try { data = await api('GET', '/api/vault'); draw(); } catch (e) { toast(e.message, 'error'); } };
+    $('#pw-q').oninput = draw;
+    load();
   }
 
   function visibilityFields(s, canPanel = true) {
@@ -539,7 +847,7 @@
       <div class="modal-foot"><button class="btn" data-close>Close</button>
         ${k.inUse ? '<button class="btn primary" id="dk-deploy">I\'ve added it: deploy now</button>' : '<button class="btn primary" id="dk-use">Use this key &amp; deploy</button>'}</div>`, {
       onMount: (m, close) => {
-        $('#dk-copy', m).onclick = () => navigator.clipboard.writeText($('#dk', m).value).then(() => toast('Copied', 'ok'));
+        $('#dk-copy', m).onclick = () => copyText($('#dk', m).value);
         $('#dk-regen', m).onclick = async () => {
           if (!(await confirmBox('Regenerate the key? The old one stops working, so replace it on the repository too.', 'Regenerate'))) return;
           try { $('#dk', m).value = (await api('POST', `/api/sites/${s.id}/deploy-key/regenerate`)).publicKey; toast('New key made: update it on the repository', 'ok'); } catch (e) { toast(e.message, 'error'); }
@@ -826,7 +1134,10 @@
           <small>Available to install/build/start commands.</small></label>
         <label class="check"><input type="checkbox" name="spa" ${s.spa ? 'checked' : ''}> <span>Single-page app — serve <code>index.html</code> for unknown paths (React/Vue router etc.)</span></label>
         ${editing ? '' : `<div class="card" style="padding:12px 14px;margin:12px 0">${visibilityFields(s)}</div>`}
-        <details class="adv" ${(s.domains || []).length || s.port ? 'open' : ''}><summary>Advanced: custom domains &amp; dedicated port</summary>
+        <details class="adv" ${(s.domains || []).length || s.port || s.nodeVersion ? 'open' : ''}><summary>Advanced: Node.js version, custom domains &amp; dedicated port</summary>
+          <label class="field"><span>Node.js version</span><select name="nodeVersion" id="node-ver" style="max-width:360px">
+              <option value="${esc(s.nodeVersion || '')}">${s.nodeVersion ? 'Node.js ' + esc(s.nodeVersion) : 'Built in'}</option></select>
+            <small>Used for the install, build and start commands (node, npm, npx). Other versions are downloaded from nodejs.org on the first deploy and kept in <code>/data/node</code>.</small></label>
           <label class="field"><span>Custom domains</span><input type="text" name="domains" value="${esc((s.domains || []).join(', '))}" placeholder="www.example.com, example.com">
             <small>Hostnames you point at this server yourself (DNS / reverse proxy). For Cloudflare, use the <b>Tunnels</b> page instead. Each domain can only belong to one site.${sys.sitesBaseDomain ? ` Also served at <b>${esc(s.slug || 'slug')}.${esc(sys.sitesBaseDomain)}</b>.` : ''}</small></label>
           <label class="field"><span>Dedicated port</span><input type="number" name="port" value="${esc(s.port || '')}" placeholder="optional, range ${range}" style="max-width:220px">
@@ -839,6 +1150,16 @@
         const toggle = () => { $('#start-field', m).style.display = $('#mode', m).value === 'node' ? '' : 'none'; };
         $('#mode', m).onchange = toggle;
         toggle();
+        api('GET', '/api/node-versions').then((nv) => {
+          const sel = $('#node-ver', m);
+          const cur = s.nodeVersion || '';
+          const opts = [['', `Built in (Node.js ${nv.builtin})`]];
+          for (const v of nv.versions) opts.push([v.major, `Node.js ${v.major} (${v.latest}${v.lts ? ', LTS ' + v.lts : ''})`]);
+          for (const v of nv.installed) if (!opts.some(([k]) => k === v)) opts.push([v, `Node.js ${v} (downloaded)`]);
+          if (cur && !opts.some(([k]) => k === cur)) opts.push([cur, `Node.js ${cur}`]);
+          sel.innerHTML = opts.map(([k, l]) => `<option value="${esc(k)}" ${k === cur ? 'selected' : ''}>${esc(l)}</option>`).join('');
+          if (nv.error) sel.title = nv.error;
+        }).catch(() => {});
         const cred = $('[name=credentialId]', m);
         const repo = $('[name=repoUrl]', m);
         const credHelp = () => {
@@ -1089,7 +1410,7 @@
       ? `<textarea readonly rows="3" class="mono" id="sshkey">${esc(r.publicKey)}</textarea>
          <div class="row" style="margin-top:8px"><button class="btn" id="copy-ssh">Copy</button><button class="btn danger" id="gen-ssh">Regenerate</button></div>`
       : '<button class="btn primary" id="gen-ssh">Generate SSH key</button>';
-    if ($('#copy-ssh')) $('#copy-ssh').onclick = () => navigator.clipboard.writeText(r.publicKey).then(() => toast('Copied', 'ok'));
+    if ($('#copy-ssh')) $('#copy-ssh').onclick = () => copyText(r.publicKey);
     $('#gen-ssh').onclick = async () => {
       if (r.publicKey && !(await confirmBox('Regenerating replaces the key; repos using the old key will stop working until you add the new one.', 'Regenerate'))) return;
       await api('POST', '/api/ssh/generate');
@@ -1363,7 +1684,7 @@
       </tbody></table>
       <p>…or give the API token <b>Zone · DNS · Edit</b> and use <b>Update API token</b> on the Tunnels page. Pagemaster will then create the record itself.</p>
       <div class="modal-foot"><button class="btn primary" data-close>OK</button></div>`, {
-      onMount: (m) => { $('#cp-target', m).onclick = () => navigator.clipboard.writeText(rec.target).then(() => toast('Copied', 'ok')); },
+      onMount: (m) => { $('#cp-target', m).onclick = () => copyText(rec.target); },
     });
   }
 
@@ -1435,18 +1756,7 @@
   }
 
   function showTunnelLog(t) {
-    const m = modal(`<div class="row"><h2 class="grow" style="margin:0">cloudflared — ${esc(t.name)}</h2><button class="btn sm" data-close>Close</button></div>
-      <pre class="logbox mono" id="tlog" style="margin-top:12px">Loading…</pre>`, { wide: true });
-    const load = async () => {
-      if (!document.body.contains(m.el)) return clearInterval(timer);
-      try {
-        const box = $('#tlog', m.el);
-        box.textContent = (await api('GET', `/api/tunnels/${t.id}/log`)) || '(no output yet)';
-        box.scrollTop = box.scrollHeight;
-      } catch (_) {}
-    };
-    const timer = setInterval(load, 3000);
-    load();
+    logViewer({ title: `cloudflared — ${esc(t.name)}`, url: `/api/tunnels/${t.id}/log`, clearUrl: `/api/tunnels/${t.id}/log`, canClear: true });
   }
 
   // ------------------------------------------------------------------ users
@@ -1465,13 +1775,13 @@
       ${list.map((u) => `<tr data-id="${esc(u.id)}">
         <td><b>${esc(u.username)}</b>${u.email ? `<div class="muted small">${esc(u.email)}</div>` : ''}</td>
         <td>${u.source === 'sso' ? '<span class="tag">SSO</span>' : '<span class="tag">Local</span>'}${u.source !== 'sso' && u.ssoLinked ? `<span class="tag" title="Can also sign in with SSO as ${esc(u.ssoName)}">+ SSO</span>` : ''}${u.disabled ? ' <span class="badge error">disabled</span>' : ''}</td>
-        <td class="hide-sm">${u.isAdmin ? '<span class="badge live">Admin</span>' : (u.permissions.length ? u.permissions.map((p) => `<span class="tag">${esc(p)}</span>`).join('') : '<span class="muted">no access</span>')}</td>
+        <td class="hide-sm">${u.isOwner ? '<span class="badge live">Main owner</span>' : u.isAdmin ? '<span class="badge live">Admin</span>' : u.isLimitedAdmin ? '<span class="badge deploying">Limited admin</span> <span class="muted small">all but Settings</span>' : (u.permissions.length ? u.permissions.map((p) => `<span class="tag">${esc(p)}</span>`).join('') : '<span class="muted">only shared sites</span>')}</td>
         <td class="hide-sm muted">${fmtTime(u.lastLogin)}</td>
-        <td style="text-align:right;white-space:nowrap"><button class="btn sm" data-a="edit">Edit</button>${u.id !== state.user.id ? '<button class="btn sm danger" data-a="rm">Delete</button>' : ''}</td>
+        <td style="text-align:right;white-space:nowrap">${!u.isOwner || u.id === state.user.id ? '<button class="btn sm" data-a="edit">Edit</button>' : ''}${u.id !== state.user.id && !u.isOwner ? '<button class="btn sm danger" data-a="rm">Delete</button>' : ''}</td>
       </tr>`).join('')}</tbody></table>`;
     $$('#user-list tr[data-id]').forEach((tr) => {
       const u = list.find((x) => x.id === tr.dataset.id);
-      $('[data-a=edit]', tr).onclick = () => userForm(u, list);
+      if ($('[data-a=edit]', tr)) $('[data-a=edit]', tr).onclick = () => userForm(u, list);
       if ($('[data-a=rm]', tr)) $('[data-a=rm]', tr).onclick = async () => {
         if (!(await confirmBox(`Delete user "${u.username}"? Sites they own will be transferred to you, and their Cloudflare tunnels are deleted.`))) return;
         try { await api('DELETE', `/api/users/${u.id}`); loadUsers(); } catch (e) { toast(e.message, 'error'); }
@@ -1494,7 +1804,12 @@
         <label class="field"><span>Username</span><input type="text" name="username" value="${esc(u.username)}" required></label>
         ${u.source === 'local' ? `<label class="field"><span>${editing ? 'Reset password' : 'Password'}</span><input type="password" name="password" ${editing ? 'placeholder="leave blank to keep"' : 'required minlength="8"'} autocomplete="new-password"></label>
         <label class="check"><input type="checkbox" name="mustChangePassword" ${!editing ? 'checked' : ''}> <span>Ask user to change password on next login</span></label>` : '<p class="muted small">SSO account — signs in through your identity provider.</p>'}
-        ${state.user.isAdmin ? `<label class="check"><input type="checkbox" name="isAdmin" id="isadmin" ${u.isAdmin ? 'checked' : ''}> <span><b>Administrator</b> — full access to everything</span></label>` : ''}
+        ${state.user.isAdmin ? `<label class="field"><span>Role</span><select name="role" id="role" ${u.isOwner ? 'disabled' : ''}>
+            <option value="user" ${!u.isAdmin && !u.isLimitedAdmin ? 'selected' : ''}>User: the permissions ticked below, plus sites shared with them</option>
+            <option value="limited" ${u.isLimitedAdmin ? 'selected' : ''}>Limited admin: everything except Settings and the main owner's account</option>
+            <option value="admin" ${u.isAdmin ? 'selected' : ''}>Admin: full access</option>
+          </select>${u.isOwner ? '<small>This is the main owner. Only they can change this account.</small>' : '<small>Only give admin roles to people you trust: the terminal and site build commands run with full access inside the container.</small>'}</label>` : ''}
+        ${editing && state.user.isOwner && u.isAdmin && u.id !== state.user.id ? '<button type="button" class="btn sm" id="make-owner">Make main owner</button>' : ''}
         ${editing && u.id !== state.user.id ? `<label class="check"><input type="checkbox" name="disabled" ${u.disabled ? 'checked' : ''}> <span>Disabled (cannot sign in)</span></label>` : ''}
         ${editing && u.ssoLinked ? `<div class="card" style="margin:10px 0;padding:10px 12px"><b>SSO identity:</b> <span class="mono">${esc(u.ssoName || 'linked')}</span>
           ${u.hasPassword ? '<label class="check"><input type="checkbox" name="unlinkSso"> <span>Unlink SSO (the user keeps signing in with their password)</span></label>' : ''}</div>` : ''}
@@ -1507,15 +1822,24 @@
         <div class="modal-foot"><button type="button" class="btn" data-close>Cancel</button><button class="btn primary">Save</button></div>
       </form>`, {
       onMount: (m, close) => {
-        const adm = $('#isadmin', m);
-        const sync = () => { if (adm) $('#perms', m).style.opacity = adm.checked ? .4 : 1; };
-        if (adm) adm.onchange = sync;
+        const role = $('#role', m);
+        const sync = () => { if (role) $('#perms', m).style.opacity = role.value !== 'user' ? .4 : 1; };
+        if (role) role.onchange = sync;
         sync();
+        if ($('#make-owner', m)) $('#make-owner', m).onclick = async () => {
+          if (!(await confirmBox(`Make "${u.username}" the main owner? You stay an admin, but they will be the only one who can change their account, and you won't be able to undo this yourself.`, 'Make main owner'))) return;
+          try { await api('POST', `/api/users/${u.id}/make-owner`); toast(`${u.username} is now the main owner`, 'ok'); close(); boot(); } catch (ex) { toast(ex.message, 'error'); }
+        };
         $('#user-form', m).onsubmit = async (e) => {
           e.preventDefault();
           const body = formData(e.target);
           if (!body.password) delete body.password;
-          if (!state.user.isAdmin) delete body.isAdmin;
+          if (state.user.isAdmin && body.role && !(role && role.disabled)) {
+            body.isAdmin = body.role === 'admin';
+            body.isLimitedAdmin = body.role === 'limited';
+          }
+          delete body.role;
+          if (!state.user.isAdmin) { delete body.isAdmin; delete body.isLimitedAdmin; }
           const linkFrom = body.linkFrom;
           delete body.linkFrom;
           if (linkFrom) {
@@ -1618,7 +1942,7 @@
           <label class="field"><span>Confirm new password</span><input type="password" name="confirm" required autocomplete="new-password"></label>
           <button class="btn primary">Change password</button>
         </form></div>` : '<div class="card muted">You sign in with SSO, so there is no local password.</div>'}
-      <div class="card"><h2>Your permissions</h2>${u.isAdmin ? '<span class="badge live">Administrator</span>' : (u.permissions.map((p) => `<span class="tag">${esc(p)}</span>`).join('') || '<span class="muted">none — ask an admin for access</span>')}</div>`;
+      <div class="card"><h2>Your permissions</h2>${u.isAdmin || u.isLimitedAdmin ? `<span class="badge live">${esc(roleLabel(u))}</span>${u.isLimitedAdmin ? ' <span class="muted small">everything except Settings</span>' : ''}` : (u.permissions.map((p) => `<span class="tag">${esc(p)}</span>`).join('') || '<span class="muted">none — ask an admin for access</span>')}</div>`;
     $('#un-form').onsubmit = async (e) => {
       e.preventDefault();
       try { await api('POST', '/api/account/username', formData(e.target)); u.username = formData(e.target).username; toast('Username changed', 'ok'); renderShell(); go('account'); }

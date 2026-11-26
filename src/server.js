@@ -15,6 +15,7 @@ const terminal = require('./terminal');
 const cloudflare = require('./cloudflare');
 const access = require('./access');
 const analytics = require('./analytics');
+const nodeVersions = require('./node-versions');
 
 const { db, save, id, encrypt, PERMISSIONS } = store;
 
@@ -104,7 +105,7 @@ app.get('/api/me', auth.requireAuth, (req, res) => {
     permissions: PERMISSIONS,
     sitePermissions: access.SITE_PERMS,
     // Access through per-site sharing (on top of the global permissions)
-    siteAccess: { view: access.anySite(req.user, 'view'), files: access.anySite(req.user, 'files.read') },
+    siteAccess: { view: access.anySite(req.user, 'view'), files: access.anySite(req.user, 'files.read'), passwords: access.anySite(req.user, 'passwords.view') },
     ssoEnabled: sso.enabled(),
   });
 });
@@ -230,6 +231,72 @@ app.post('/api/sites/:id/webhook/rotate', S('manage'), (req, res) => {
 });
 app.get('/api/sites/:id/log', S('view'), (req, res) => {
   res.type('text/plain').send(sites.readLog(req.site));
+});
+app.delete('/api/sites/:id/log', S('deploy'), (req, res) => {
+  sites.clearLog(req.site);
+  res.json({ ok: true });
+});
+
+// Node.js versions a site can pick
+app.get('/api/node-versions', auth.requireAuth, wrap(async (_req, res) => res.json(await nodeVersions.available())));
+
+// Notes (one shared text per site)
+app.put('/api/sites/:id/notes', S('notes.edit'), json, (req, res) => {
+  const text = String(req.body.text || '');
+  if (text.length > 100000) return res.status(400).json({ error: 'Notes are limited to 100,000 characters' });
+  req.site.notes = { text, updatedBy: req.user.username, updatedAt: Date.now() };
+  save();
+  res.json(siteOut(req, req.site));
+});
+
+// Password vault (per site). Passwords are stored encrypted and only sent when
+// someone with passwords.view asks for one.
+function vaultOut(e) {
+  return { id: e.id, title: e.title, username: e.username, url: e.url, notes: e.notes, hasPassword: !!e.password, updatedBy: e.updatedBy, updatedAt: e.updatedAt };
+}
+function vaultInput(b, existing = {}) {
+  const title = String(b.title || '').trim().slice(0, 120);
+  if (!title) throw Object.assign(new Error('Give the entry a name'), { status: 400 });
+  const out = {
+    title,
+    username: String(b.username || '').slice(0, 300),
+    url: String(b.url || '').trim().slice(0, 500),
+    notes: String(b.notes || '').slice(0, 5000),
+  };
+  if (b.password !== undefined && b.password !== null && (b.password !== '' || !existing.password)) out.password = b.password === '' ? '' : encrypt(String(b.password).slice(0, 1000));
+  return out;
+}
+app.get('/api/vault', auth.requireAuth, (req, res) => {
+  res.json(db().sites.filter((s) => access.siteCan(req.user, s, 'passwords.view')).map((s) => ({
+    siteId: s.id, siteName: s.name, slug: s.slug, canEdit: access.siteCan(req.user, s, 'passwords.edit'), entries: (s.vault || []).map(vaultOut),
+  })));
+});
+app.get('/api/sites/:id/vault', S('passwords.view'), (req, res) => {
+  res.json({ canEdit: access.siteCan(req.user, req.site, 'passwords.edit'), entries: (req.site.vault || []).map(vaultOut) });
+});
+app.post('/api/sites/:id/vault', S('passwords.edit'), json, (req, res) => {
+  const e = { id: id(), ...vaultInput(req.body), updatedBy: req.user.username, updatedAt: Date.now() };
+  req.site.vault = [...(req.site.vault || []), e];
+  save();
+  res.json(vaultOut(e));
+});
+app.put('/api/sites/:id/vault/:eid', S('passwords.edit'), json, (req, res) => {
+  const e = (req.site.vault || []).find((x) => x.id === req.params.eid);
+  if (!e) return res.status(404).json({ error: 'Entry not found' });
+  Object.assign(e, vaultInput(req.body, e), { updatedBy: req.user.username, updatedAt: Date.now() });
+  save();
+  res.json(vaultOut(e));
+});
+app.delete('/api/sites/:id/vault/:eid', S('passwords.edit'), (req, res) => {
+  req.site.vault = (req.site.vault || []).filter((x) => x.id !== req.params.eid);
+  save();
+  res.json({ ok: true });
+});
+app.post('/api/sites/:id/vault/:eid/reveal', S('passwords.view'), (req, res) => {
+  const e = (req.site.vault || []).find((x) => x.id === req.params.eid);
+  if (!e) return res.status(404).json({ error: 'Entry not found' });
+  console.log(`[vault] ${req.user.username} viewed "${e.title}" of site "${req.site.name}"`);
+  res.json({ password: e.password ? store.decrypt(e.password) : '' });
 });
 
 // Website / panel visibility
@@ -366,6 +433,15 @@ function grantable(req, list) {
   const perms = cleanPerms(list);
   return req.user.isAdmin ? perms : perms.filter((p) => auth.can(req.user, p));
 }
+const isPriv = (u) => !!(u.isAdmin || u.isLimitedAdmin);
+// Who may change this account at all? Admin accounts need a full admin; the main
+// owner can only be changed by themselves.
+function guardTarget(req, u, wantsPriv = false) {
+  if (u.isOwner && u.id !== req.user.id) return 'Only the main owner can change the main owner account';
+  if ((isPriv(u) || wantsPriv) && !req.user.isAdmin && u.id !== req.user.id) return 'Only admins can change admin accounts';
+  if (wantsPriv && !req.user.isAdmin) return 'Only admins can make admins';
+  return null;
+}
 function adminCount() {
   return db().users.filter((u) => u.isAdmin && !u.disabled).length;
 }
@@ -398,6 +474,8 @@ app.post('/api/users/:id/link-sso', P('users.manage'), json, (req, res) => {
   const target = d.users.find((x) => x.id === req.params.id);
   const from = d.users.find((x) => x.id === req.body.fromUserId);
   if (!target || !from) return res.status(404).json({ error: 'User not found' });
+  const g = guardTarget(req, target) || guardTarget(req, from);
+  if (g) return res.status(403).json({ error: g });
   if (target.id === from.id) return res.status(400).json({ error: 'Pick a different user' });
   if (!from.ssoSubject) return res.status(400).json({ error: `${from.username} has no SSO identity` });
   if (from.id === req.user.id) return res.status(400).json({ error: 'You cannot merge away the account you are signed in with' });
@@ -407,6 +485,7 @@ app.post('/api/users/:id/link-sso', P('users.manage'), json, (req, res) => {
   if (!target.displayName && from.displayName) target.displayName = from.displayName;
   if (!target.isAdmin) {
     target.isAdmin = !!from.isAdmin;
+    target.isLimitedAdmin = !target.isAdmin && !!(target.isLimitedAdmin || from.isLimitedAdmin);
     target.permissions = cleanPerms([...(target.permissions || []), ...(from.permissions || [])]);
   }
   handOver(from.id, target.id);
@@ -424,13 +503,14 @@ app.post('/api/users', P('users.manage'), json, (req, res) => {
   if (d.users.some((x) => x.username.toLowerCase() === username.toLowerCase())) return res.status(409).json({ error: 'Username taken' });
   const err = auth.validatePassword(req.body.password);
   if (err) return res.status(400).json({ error: err });
-  if (req.body.isAdmin && !req.user.isAdmin) return res.status(403).json({ error: 'Only admins can create admins' });
+  if ((req.body.isAdmin || req.body.isLimitedAdmin) && !req.user.isAdmin) return res.status(403).json({ error: 'Only admins can create admins' });
   const u = {
     id: id(),
     username,
     passwordHash: auth.hashPassword(req.body.password),
     source: 'local',
     isAdmin: !!req.body.isAdmin,
+    isLimitedAdmin: !req.body.isAdmin && !!req.body.isLimitedAdmin,
     permissions: grantable(req, req.body.permissions),
     mustChangePassword: !!req.body.mustChangePassword,
     disabled: false,
@@ -444,9 +524,15 @@ app.put('/api/users/:id', P('users.manage'), json, (req, res) => {
   const d = db();
   const u = d.users.find((x) => x.id === req.params.id);
   if (!u) return res.status(404).json({ error: 'Not found' });
-  if ((u.isAdmin || req.body.isAdmin) && !req.user.isAdmin) return res.status(403).json({ error: 'Only admins can change admin accounts' });
-  if (u.id === req.user.id && (req.body.isAdmin === false || req.body.disabled)) {
+  const wantsPriv = (!!req.body.isAdmin && !u.isAdmin) || (!!req.body.isLimitedAdmin && !u.isLimitedAdmin);
+  const g = guardTarget(req, u, wantsPriv);
+  if (g) return res.status(403).json({ error: g });
+  const demote = (req.body.isAdmin === false && u.isAdmin) || (req.body.isLimitedAdmin === false && u.isLimitedAdmin && !req.body.isAdmin);
+  if (u.id === req.user.id && (demote || req.body.disabled)) {
     return res.status(400).json({ error: 'You cannot remove your own admin rights or disable yourself' });
+  }
+  if (u.isOwner && (req.body.isAdmin === false || req.body.disabled)) {
+    return res.status(400).json({ error: 'Make someone else the main owner first' });
   }
   if (u.isAdmin && (req.body.isAdmin === false || req.body.disabled) && adminCount() <= 1) {
     return res.status(400).json({ error: 'At least one active admin is required' });
@@ -458,7 +544,9 @@ app.put('/api/users/:id', P('users.manage'), json, (req, res) => {
     u.username = name;
   }
   if (req.body.permissions !== undefined) u.permissions = grantable(req, req.body.permissions);
-  if (req.body.isAdmin !== undefined) u.isAdmin = !!req.body.isAdmin;
+  if (req.body.isAdmin !== undefined && req.user.isAdmin) u.isAdmin = !!req.body.isAdmin;
+  if (req.body.isLimitedAdmin !== undefined && req.user.isAdmin) u.isLimitedAdmin = !u.isAdmin && !!req.body.isLimitedAdmin;
+  if (u.isAdmin) u.isLimitedAdmin = false;
   if (req.body.disabled !== undefined) u.disabled = !!req.body.disabled;
   if (req.body.unlinkSso && u.ssoSubject) {
     if (!u.passwordHash) return res.status(400).json({ error: 'This account has no password; unlinking SSO would lock it out. Delete it instead.' });
@@ -481,7 +569,8 @@ app.delete('/api/users/:id', P('users.manage'), wrap(async (req, res) => {
   const u = d.users.find((x) => x.id === req.params.id);
   if (!u) return res.status(404).json({ error: 'Not found' });
   if (u.id === req.user.id) return res.status(400).json({ error: 'You cannot delete yourself' });
-  if (u.isAdmin && !req.user.isAdmin) return res.status(403).json({ error: 'Only admins can delete admins' });
+  if (u.isOwner) return res.status(400).json({ error: 'The main owner cannot be deleted. Make someone else the main owner first.' });
+  if (isPriv(u) && !req.user.isAdmin) return res.status(403).json({ error: 'Only admins can delete admins' });
   if (u.isAdmin && adminCount() <= 1) return res.status(400).json({ error: 'At least one active admin is required' });
   await cloudflare.removeUserTunnels(u.id);
   handOver(u.id, req.user.id); // their sites now belong to whoever deleted them
@@ -490,6 +579,17 @@ app.delete('/api/users/:id', P('users.manage'), wrap(async (req, res) => {
   save();
   res.json({ ok: true });
 }));
+
+// Hand the main owner role to another full admin
+app.post('/api/users/:id/make-owner', auth.requireAuth, (req, res) => {
+  if (!req.user.isOwner) return res.status(403).json({ error: 'Only the main owner can do this' });
+  const u = db().users.find((x) => x.id === req.params.id);
+  if (!u || u.disabled || !u.isAdmin) return res.status(400).json({ error: 'The new main owner must be an active full admin' });
+  req.user.isOwner = false;
+  u.isOwner = true;
+  save();
+  res.json(auth.publicUser(u));
+});
 
 // ------------------------------------------------------------------ settings
 function settingsOut(req) {
@@ -584,6 +684,7 @@ app.post('/api/tunnels/:id/transfer', T, json, (req, res) => {
   res.json({ ok: true });
 });
 app.delete('/api/tunnels/:id/routes/:rid', T, wrap(async (req, res) => res.json(await cloudflare.removeRoute(req.user, req.params.id, req.params.rid))));
+app.delete('/api/tunnels/:id/log', T, (req, res) => { cloudflare.clearLog(req.user, req.params.id); res.json({ ok: true }); });
 app.get('/api/tunnels/:id/log', T, (req, res) => res.type('text/plain').send(cloudflare.readLog(req.user, req.params.id)));
 
 // ------------------------------------------------------------------ files

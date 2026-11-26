@@ -12,6 +12,7 @@ const { db, save, id, decrypt, sign, verifySig } = require('./db');
 const analytics = require('./analytics');
 const access = require('./access');
 const auth = require('./auth');
+const nodeVersions = require('./node-versions');
 
 const runtime = new Map(); // siteId -> { deploying, queued, proc, stopping, restarts, server, serverPort, handler, handlerDir }
 const proxy = httpProxy.createProxyServer({ xfwd: true, ws: true });
@@ -42,6 +43,10 @@ function log(site, msg) {
     try { if (fs.statSync(f).size > 2 * 1024 * 1024) fs.renameSync(f, f + '.1'); } catch (_) {}
     fs.appendFileSync(f, line);
   } catch (_) {}
+}
+
+function clearLog(site) {
+  for (const f of [logFile(site), logFile(site) + '.1']) fs.rmSync(f, { force: true });
 }
 
 function readLog(site, bytes = 200000) {
@@ -172,6 +177,13 @@ async function validate(input, existingId) {
     throw e;
   }
 
+  const nodeVersion = String(input.nodeVersion || '').trim();
+  if (nodeVersion && !nodeVersions.VERSION_RE.test(nodeVersion)) {
+    const e = new Error('Node.js version must be a major version like 20, or an exact one like 20.11.1');
+    e.status = 400;
+    throw e;
+  }
+
   const autoPull = Math.max(0, Math.min(1440, parseInt(input.autoPullMinutes || 0, 10) || 0));
   return {
     name,
@@ -189,6 +201,7 @@ async function validate(input, existingId) {
     port,
     spa: !!input.spa,
     autoPullMinutes: autoPull,
+    nodeVersion,
   };
 }
 
@@ -351,7 +364,12 @@ async function deploy(siteId, opts = {}) {
       const chk = checkStorage();
       if (!chk.ok) throw new Error(`Storage problem in ${config.SITES_DIR}: ${chk.problem}\n${STORAGE_FIX}`);
     }
-    const buildEnv ={ ...process.env, ...parseEnv(site.env), CI: 'true' };
+    let buildEnv = { ...process.env, ...parseEnv(site.env), CI: 'true' };
+    if (site.nodeVersion && (site.installCommand || site.buildCommand || site.mode === 'node')) {
+      const bin = await nodeVersions.binDir(site.nodeVersion, (m) => log(site, m));
+      buildEnv = nodeVersions.withNode(buildEnv, bin);
+      log(site, `Using Node.js ${bin ? site.nodeVersion + ' (' + path.dirname(bin) + ')' : nodeVersions.BUILTIN + ' (built in)'}`);
+    }
     if (site.installCommand) await run(site, 'sh', ['-c', site.installCommand], { cwd: dir, env: buildEnv, display: site.installCommand });
     if (site.buildCommand) await run(site, 'sh', ['-c', site.buildCommand], { cwd: dir, env: buildEnv, display: site.buildCommand });
 
@@ -421,7 +439,12 @@ async function startApp(site) {
   const r = rt(site.id);
   const s = db().sites.find((x) => x.id === site.id);
   if (!s.internalPort) { s.internalPort = await allocInternalPort(s.id); save(); }
-  const env = { ...process.env, ...parseEnv(s.env), PORT: String(s.internalPort), HOST: '127.0.0.1', NODE_ENV: 'production' };
+  let env = { ...process.env, ...parseEnv(s.env), PORT: String(s.internalPort), HOST: '127.0.0.1', NODE_ENV: 'production' };
+  if (s.nodeVersion) {
+    let bin = nodeVersions.installedBin(s.nodeVersion);
+    if (!bin) bin = await nodeVersions.binDir(s.nodeVersion, (m) => log(s, m));
+    env = nodeVersions.withNode(env, bin);
+  }
   log(s, `Starting app: ${s.startCommand} (PORT=${s.internalPort})`);
   const p = spawn('sh', ['-c', s.startCommand], { cwd: publishDir(s), env, detached: true });
   r.proc = p;
@@ -991,6 +1014,8 @@ function info(site) {
     tunnelHosts,
     stats7d: analytics.quick(site.id, 7),
     webhookSecret: undefined,
+    vault: undefined,
+    vaultCount: (site.vault || []).length,
     running: site.mode === 'node' ? !!r.proc : undefined,
     deploying: !!r.deploying,
   };
@@ -1026,7 +1051,7 @@ async function shutdown() {
 }
 
 module.exports = {
-  create, update, remove, deploy, setEnabled, setPrimary, setVisibility, info,
+  clearLog, create, update, remove, deploy, setEnabled, setPrimary, setVisibility, info,
   ensureSiteKey, makeTicket, trustedHosts, AUTH_PATH, readLog, startAll, shutdown,
   hostingHandler, hostingUpgrade, repoDir, slugify,
   checkStorage, getStorageCheck: () => storageCheck, STORAGE_FIX,

@@ -12,6 +12,9 @@ A self-hosted control panel for hosting websites straight from git repositories.
 - **Site ownership & sharing.** Every site has an owner who can share it with individual users (view, deploy, manage, files) or transfer it to someone else.
 - **Built-in analytics** per site: visitors, page views, top pages, referrers, countries, status codes and bandwidth. No cookies or tracking script.
 - **Deploy keys per site.** Every site gets its own SSH key. Pick *Deploy key for this site* when adding it, paste the key into the repo's deploy keys, done.
+- **Node.js version per site** (Edit → Advanced). Other versions are downloaded from nodejs.org on first use.
+- **Notes and a password vault per site**, shared with the people you choose, plus a **Passwords** page listing every vault you can see.
+- **Roles:** main owner, admin, limited admin (everything except Settings and the owner's account), and users with fine-grained permissions.
 - **Private or public**, per site: a private website asks visitors to sign in to Pagemaster first, and a private site is hidden in the panel from users it isn't shared with. New sites are private on both.
 - **Primary address.** When a site has several URLs, pick the main one and optionally redirect the others to it.
 - **SSO (OpenID Connect)** for Authentik, Authelia, Keycloak, Zitadel, Pocket ID, Google, Entra ID and others. Local login stays available. New SSO users get the **lowest access** (`sites.view` only) until an admin raises it.
@@ -189,6 +192,13 @@ Signing in with SSO for the first time creates a new user. To use SSO with the a
 - **Yourself:** sign in with your password, go to **My Account → Single sign-on → Link SSO account**, and log in at your provider. From then on, *Sign in with SSO* opens that account. Your password keeps working, and you can unlink at any time.
 - **As an admin:** if SSO already created a duplicate user, open the original user in **Users → Edit**, pick the duplicate under *Link an SSO user into this account* and save. The SSO login, sites, shares and tunnels move over and the duplicate is deleted.
 
+## Roles
+
+- **Main owner**: the first admin. Only they can change or delete their own account. They can hand the role to another admin (Users → Edit → *Make main owner*).
+- **Admin**: everything.
+- **Limited admin**: everything except **Settings** (SSO, public URL, base domain) and the main owner's account. They can manage normal users but not admins. Note that the terminal and site build commands run with full access inside the container, so only give admin roles to people you trust.
+- **User**: only the permissions ticked in Users, plus sites shared with them or visible to all users.
+
 ## Site ownership, sharing and analytics
 
 - The user who adds a site **owns** it. Sites that existed before this feature belong to the first admin.
@@ -200,6 +210,11 @@ Signing in with SSO for the first time creates a new user. To use SSO with the a
   - **In Pagemaster:** *private* means only the owner, people it is shared with, and admins (or users with the global `sites.*` permissions) see it; *all users* lets every Pagemaster user see it.
   - New SSO users get no global permissions by default, so they only see what is shared with them or visible to all users.
 - **Deploy keys:** every site has its own SSH key (⚙ Settings → Deploy key). Choose *Deploy key for this site (SSH)* as the git credential when adding a site; Pagemaster shows the key, with a link to the repository's deploy key page on GitHub, GitLab, Bitbucket and Codeberg, and waits for you to click **deploy now**. HTTPS URLs are switched to SSH automatically. The shared SSH key under Git Credentials still works for existing sites.
+- **☰ Options** on each site card opens every action in one menu: preview, analytics, logs (with **Clear logs**), notes, passwords, files, deploy, start/stop, publish, edit, visibility, primary address, deploy key, webhook, sharing, transfer and delete.
+- The Sites page shows **your own sites** by default. The filter row has a search box, an owner picker (my sites, all sites, other people's, or one owner) and a status/visibility picker.
+- **Node.js version** (Edit → Advanced): *Built in* uses the Node.js in the image. Any other major (18, 20, 22, 24, …) is downloaded from nodejs.org on the next deploy, kept in `/data/node`, and put first on `PATH` for the install, build and start commands, so `node`, `npm` and `npx` all match. The container needs internet access for the first download.
+- **Notes**: one shared text per site. Anyone who can see the site can read it; editing needs `notes.edit` (owner, admins and global `sites.manage` have it).
+- **Passwords**: saved logins per site (name, username, password, address, notes), encrypted in `/data/pagemaster.json` with the instance key. They have their own site permissions, `passwords.view` and `passwords.edit`, which only the site owner, admins and limited admins have by default. No global permission includes them. Passwords are only sent to the browser when someone clicks Show or Copy, and each reveal is logged in the container log.
 - **📊 Analytics** shows visitors, page views, requests, bandwidth, error rate, top pages, referrers, countries (via Cloudflare) and which address people used. It is counted from the requests Pagemaster serves, with no cookies and no script added to your site. Data is kept for 400 days in `/data/analytics.json`.
 
 ## Cloudflare Tunnels (per user)

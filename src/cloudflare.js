@@ -104,7 +104,7 @@ async function pushIngress(t) {
 
 // ---------------------------------------------------------------- access helpers
 function canAccess(user, t) {
-  return !!user && (user.isAdmin || t.userId === user.id);
+  return !!user && (user.isAdmin || user.isLimitedAdmin || t.userId === user.id);
 }
 
 function get(user, tunnelId) {
@@ -386,6 +386,11 @@ function tlog(t, msg) {
   } catch (_) {}
 }
 
+function clearLog(user, tunnelId) {
+  const t = get(user, tunnelId);
+  fs.rmSync(logFile(t), { force: true });
+}
+
 function readLog(user, tunnelId) {
   const t = get(user, tunnelId);
   const f = logFile(t);
@@ -482,6 +487,7 @@ async function shutdown() {
 }
 
 module.exports = {
+  clearLog,
   inspectToken, listZones, list, get, create, remove, addRoute, removeRoute,
   removeSiteRoutes, removeUserTunnels, updateToken, setEnabled, readLog, startAll, shutdown, hostnameOwner,
 };

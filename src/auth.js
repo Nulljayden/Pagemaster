@@ -14,6 +14,7 @@ function ensureDefaultAdmin() {
       passwordHash: bcrypt.hashSync('admin', 10),
       source: 'local',
       isAdmin: true,
+      isOwner: true,
       permissions: Object.keys(PERMISSIONS),
       mustChangePassword: true,
       disabled: false,
@@ -33,7 +34,9 @@ function publicUser(u) {
     email: u.email || '',
     source: u.source,
     isAdmin: !!u.isAdmin,
-    permissions: u.isAdmin ? Object.keys(PERMISSIONS) : (u.permissions || []),
+    isLimitedAdmin: !u.isAdmin && !!u.isLimitedAdmin,
+    isOwner: !!u.isOwner,
+    permissions: Object.keys(PERMISSIONS).filter((p) => can({ ...u, disabled: false }, p)),
     mustChangePassword: !!u.mustChangePassword,
     disabled: !!u.disabled,
     createdAt: u.createdAt,
@@ -47,6 +50,8 @@ function publicUser(u) {
 function can(user, perm) {
   if (!user || user.disabled) return false;
   if (user.isAdmin) return true;
+  // Limited admin: everything except the global settings
+  if (user.isLimitedAdmin) return perm !== 'settings.manage';
   return (user.permissions || []).includes(perm);
 }
 
