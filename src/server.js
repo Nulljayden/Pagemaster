@@ -106,6 +106,7 @@ app.get('/api/system', auth.requireAuth, (_req, res) => {
     sitesBaseDomain: d.settings.sitesBaseDomain || '',
     storage: { ...sites.getStorageCheck(), fix: sites.STORAGE_FIX },
     version: require('../package.json').version,
+    build: (process.env.PAGEMASTER_BUILD || 'dev').slice(0, 7),
   });
 });
 

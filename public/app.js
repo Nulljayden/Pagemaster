@@ -151,6 +151,7 @@
             <strong>${esc(u.displayName || u.username)}</strong>
             ${u.isAdmin ? 'Administrator' : (u.source === 'sso' ? 'SSO user' : 'User')}
             <div style="margin-top:8px"><button class="btn sm" id="logout">Sign out</button></div>
+            <div class="small" style="margin-top:10px" title="Pagemaster version and image build">v${esc(state.system.version)} · build ${esc(state.system.build)}</div>
           </div>
         </aside>
         <main class="main" id="page"></main>
@@ -263,6 +264,7 @@
         </div>
         <div class="row site-actions">
           <button class="btn sm" data-act="preview">👁 Preview</button>
+          ${can('tunnels.manage') ? '<button class="btn sm" data-act="publish">☁ Publish</button>' : ''}
           ${can('sites.deploy') ? `<button class="btn sm" data-act="deploy">⟳ Pull &amp; deploy</button>
             ${s.enabled === false ? '<button class="btn sm" data-act="start">▶ Start</button>' : '<button class="btn sm" data-act="stop">■ Stop</button>'}` : ''}
           <button class="btn sm" data-act="log">Logs</button>
@@ -353,6 +355,7 @@
       if (act === 'edit') siteForm(s);
       if (act === 'log') showLog(s);
       if (act === 'preview') { showPreview(s); return; }
+      if (act === 'publish') { publishSite(s); return; }
       if (act === 'files') { state.filesPath = '/' + s.slug; go('files'); return; }
       if (act === 'webhook') showWebhook(s);
       if (act === 'delete') {
@@ -813,7 +816,7 @@
     });
   }
 
-  function tunnelForm() {
+  function tunnelForm(onCreated) {
     modal(`<h2>Connect Cloudflare</h2>
       <form id="tun-form">
         <label class="field"><span>How do you want to connect?</span><select name="mode" id="tun-mode">
@@ -861,17 +864,18 @@
           btn.disabled = true;
           btn.textContent = 'Creating…';
           try {
-            await api('POST', '/api/tunnels', formData(e.target));
+            const created = await api('POST', '/api/tunnels', formData(e.target));
             toast('Tunnel created, starting cloudflared…', 'ok');
             close();
-            renderTunnels(await api('GET', '/api/tunnels'));
+            if (onCreated) onCreated(created);
+            else renderTunnels(await api('GET', '/api/tunnels'));
           } catch (ex) { toast(ex.message, 'error'); } finally { btn.disabled = false; btn.textContent = 'Create tunnel'; }
         };
       },
     });
   }
 
-  async function routeForm(t) {
+  async function routeForm(t, opts = {}) {
     let sites = [];
     let zones = [];
     try {
@@ -882,7 +886,7 @@
     if (t.mode === 'api' && !zones.length) return toast('This API token cannot see any domains. Give it Zone → Zone → Read and DNS → Edit for your domain.', 'error');
     modal(`<h2>Publish a site through "${esc(t.name)}"</h2>
       <form id="route-form">
-        <label class="field"><span>Site</span><select name="siteId" id="rt-site">${sites.map((s) => `<option value="${esc(s.id)}" data-slug="${esc(s.slug)}">${esc(s.name)} (/${esc(s.slug)}/)</option>`).join('')}</select></label>
+        <label class="field"><span>Site</span><select name="siteId" id="rt-site">${sites.map((s) => `<option value="${esc(s.id)}" data-slug="${esc(s.slug)}" ${s.id === opts.siteId ? 'selected' : ''}>${esc(s.name)} (/${esc(s.slug)}/)</option>`).join('')}</select></label>
         ${t.mode === 'api' ? `
         <div class="grid2">
           <label class="field"><span>Subdomain</span><input type="text" name="subdomain" id="rt-sub" placeholder="blank = the domain itself"></label>
@@ -921,10 +925,36 @@
             await api('POST', `/api/tunnels/${t.id}/routes`, formData(e.target));
             toast(`Published ${$('#rt-preview', m).textContent}. DNS can take a minute.`, 'ok');
             close();
-            renderTunnels(await api('GET', '/api/tunnels'));
+            if (state.page === 'tunnels') renderTunnels(await api('GET', '/api/tunnels'));
+            if (state.page === 'sites') renderSiteList(await api('GET', '/api/sites'));
           } catch (ex) { toast(ex.message, 'error'); } finally { btn.disabled = false; }
         };
       },
+    });
+  }
+
+  // "☁ Publish" on a site card: pick (or create) your tunnel, then choose the hostname
+  async function publishSite(site) {
+    let tunnels = [];
+    try { tunnels = await api('GET', '/api/tunnels'); } catch (e) { return toast(e.message, 'error'); }
+    const mine = tunnels.filter((t) => t.userId === state.user.id);
+    const usable = mine.length ? mine : tunnels;
+    const next = (t) => routeForm(t, { siteId: site.id });
+    if (!usable.length) {
+      modal(`<h2>Publish "${esc(site.name)}" on your domain</h2>
+        <p>Sites are published through a <b>Cloudflare Tunnel</b> on your own Cloudflare account, with no ports or port-forwarding.</p>
+        <p class="muted">First connect your Cloudflare account (one time). Then you'll choose the address, e.g. <code>${esc(site.slug)}.yourdomain.com</code>.</p>
+        <div class="modal-foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="go-connect">Connect Cloudflare</button></div>`, {
+        onMount: (m, close) => { $('#go-connect', m).onclick = () => { close(); tunnelForm(next); }; },
+      });
+      return;
+    }
+    if (usable.length === 1) return next(usable[0]);
+    modal(`<h2>Publish "${esc(site.name)}"</h2>
+      <label class="field"><span>Through which tunnel?</span><select id="pick-tun">${usable.map((t) =>
+        `<option value="${esc(t.id)}">${esc(t.name)}${t.accountName ? ' (' + esc(t.accountName) + ')' : ''}${t.userId !== state.user.id ? ' [' + esc(t.owner) + ']' : ''}</option>`).join('')}</select></label>
+      <div class="modal-foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="pick-next">Next</button></div>`, {
+      onMount: (m, close) => { $('#pick-next', m).onclick = () => { const id = $('#pick-tun', m).value; close(); next(usable.find((t) => t.id === id)); }; },
     });
   }
 

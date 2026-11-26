@@ -25,6 +25,9 @@ COPY package.json ./
 COPY src ./src
 COPY public ./public
 
+# Commit the image was built from (shown in the UI sidebar)
+ARG GIT_SHA=dev
+ENV PAGEMASTER_BUILD=${GIT_SHA}
 ENV NODE_ENV=production \
     DATA_DIR=/data \
     ADMIN_PORT=38080 \
