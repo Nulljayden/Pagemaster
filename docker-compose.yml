@@ -1,0 +1,24 @@
+# Pagemaster - multi-repo web hosting panel
+# Works with: docker compose, TrueNAS SCALE (Apps > Discover > Custom App > Install via YAML),
+# Portainer, Dockge, or Docker inside a Proxmox LXC/VM.
+services:
+  pagemaster:
+    image: ghcr.io/nulljayden/pagemaster:latest
+    # To build locally instead of pulling, comment `image` and uncomment:
+    # build: .
+    container_name: pagemaster
+    restart: unless-stopped
+    environment:
+      - TZ=Etc/UTC
+      - ADMIN_PORT=8080          # admin web UI
+      - HOSTING_PORT=8081        # shared port: routes by domain or /<slug>/
+      - SITE_PORT_RANGE=8100-8199 # ports sites may claim as their own (must match ports below)
+      # - TRUST_PROXY=true       # set when behind a reverse proxy (Nginx Proxy Manager, Traefik, Caddy...)
+      # - COOKIE_SECURE=true     # set when the admin UI is only reached over HTTPS
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+      - "8100-8199:8100-8199"
+    volumes:
+      # TrueNAS: change to a dataset path, e.g. /mnt/tank/apps/pagemaster:/data
+      - ./data:/data
