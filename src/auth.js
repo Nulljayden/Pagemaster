@@ -81,6 +81,19 @@ function userFromToken(token) {
   return u;
 }
 
+// Short id of the current session (used to tie private-site cookies to it, so
+// signing out of Pagemaster also signs out of private sites)
+function sessionKey(req) {
+  const token = req.cookies && req.cookies[COOKIE];
+  return token ? hash(token).slice(0, 24) : '';
+}
+
+function sessionAlive(key) {
+  if (!key) return false;
+  const now = Date.now();
+  return db().sessions.some((s) => s.expires > now && s.token.startsWith(key));
+}
+
 function destroySession(req, res) {
   const token = req.cookies && req.cookies[COOKIE];
   if (token) {
@@ -161,6 +174,8 @@ module.exports = {
   createSession,
   destroySession,
   destroyUserSessions,
+  sessionKey,
+  sessionAlive,
   userFromToken,
   attachUser,
   requireAuth,

@@ -8,8 +8,10 @@ const { spawn, execFileSync } = require('child_process');
 const express = require('express');
 const httpProxy = require('http-proxy');
 const config = require('./config');
-const { db, save, id, decrypt } = require('./db');
+const { db, save, id, decrypt, sign, verifySig } = require('./db');
 const analytics = require('./analytics');
+const access = require('./access');
+const auth = require('./auth');
 
 const runtime = new Map(); // siteId -> { deploying, queued, proc, stopping, restarts, server, serverPort, handler, handlerDir }
 const proxy = httpProxy.createProxyServer({ xfwd: true, ws: true });
@@ -59,6 +61,13 @@ const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/;
 const HOST_RE = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const BRANCH_RE = /^[A-Za-z0-9._\/-]{1,200}$/;
 
+function toSshUrl(url) {
+  const m = String(url).match(/^https?:\/\/([^/:@]+)(?::\d+)?\/(.+?)\/?$/);
+  if (!m) return url;
+  const repoPath = m[2].replace(/\.git$/, '');
+  return `git@${m[1]}:${repoPath}.git`;
+}
+
 function slugify(s) {
   return String(s || '').toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'site';
 }
@@ -105,11 +114,15 @@ async function validate(input, existingId) {
   if (!SLUG_RE.test(slug)) errors.push('Slug must be lowercase letters, numbers and dashes (max 40)');
   if (others.some((s) => s.slug === slug)) errors.push(`Slug/path "/${slug}/" is already used by another site`);
 
-  const repoUrl = String(input.repoUrl || '').trim();
+  let repoUrl = String(input.repoUrl || '').trim();
+  const credentialId = String(input.credentialId || 'auto');
+  // Deploy keys only work over SSH: turn https://host/owner/repo into git@host:owner/repo.git
+  if (credentialId === 'deploykey') repoUrl = toSshUrl(repoUrl);
   if (!/^(https?:\/\/|ssh:\/\/|git:\/\/|[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:)/.test(repoUrl)) {
     errors.push('Repo URL must be https://, http://, ssh://, git:// or git@host:owner/repo');
   }
   if (/^https?:\/\/[^/]*@/.test(repoUrl)) errors.push('Do not put credentials in the URL - add a Git credential instead');
+  if (credentialId === 'deploykey' && /^https?:\/\//.test(repoUrl)) errors.push('Deploy keys need an SSH repository URL (git@host:owner/repo.git)');
 
   const branch = String(input.branch || '').trim();
   if (branch && (!BRANCH_RE.test(branch) || branch.startsWith('-'))) errors.push('Invalid branch name');
@@ -165,7 +178,7 @@ async function validate(input, existingId) {
     slug,
     repoUrl,
     branch,
-    credentialId: String(input.credentialId || 'auto'),
+    credentialId,
     subdir,
     mode,
     installCommand: String(input.installCommand || '').trim(),
@@ -199,8 +212,32 @@ function credentialFor(site) {
   return d.credentials.find((c) => (c.host || '').toLowerCase() === host) || null;
 }
 
+// ---------------------------------------------------------------- deploy keys
+// Every site gets its own SSH key pair. Git hosts (GitHub especially) only accept
+// a deploy key on one repository, so a key per site is what makes them usable.
+const SITE_KEYS_DIR = path.join(config.SSH_DIR, 'sites');
+function siteKeyPath(site) { return path.join(SITE_KEYS_DIR, site.id); }
+
+function ensureSiteKey(site, regenerate = false) {
+  const key = siteKeyPath(site);
+  if (regenerate) {
+    fs.rmSync(key, { force: true });
+    fs.rmSync(key + '.pub', { force: true });
+  }
+  if (!fs.existsSync(key)) {
+    fs.mkdirSync(SITE_KEYS_DIR, { recursive: true, mode: 0o700 });
+    execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', `pagemaster-${site.slug}`, '-f', key]);
+  }
+  return fs.readFileSync(key + '.pub', 'utf8').trim();
+}
+
+function removeSiteKey(site) {
+  fs.rmSync(siteKeyPath(site), { force: true });
+  fs.rmSync(siteKeyPath(site) + '.pub', { force: true });
+}
+
 function gitEnv(site) {
-  const key = path.join(config.SSH_DIR, 'id_ed25519');
+  const key = site.credentialId === 'deploykey' ? siteKeyPath(site) : path.join(config.SSH_DIR, 'id_ed25519');
   const env = {
     ...process.env,
     GIT_TERMINAL_PROMPT: '0',
@@ -329,7 +366,9 @@ async function deploy(siteId, opts = {}) {
     if (site) {
       log(site, `ERROR: ${e.message}`);
       // A failed install/build can leave node_modules half-deleted: don't run the app on it
-      const extra = { lastError: e.message, lastCheck: Date.now() };
+      let msg = e.message;
+      if (stage === 'fetch' && site.credentialId === 'deploykey') msg += '. Check that this site\'s deploy key is added to the repository (⚙ Settings → Deploy key).';
+      const extra = { lastError: msg, lastCheck: Date.now() };
       if (stage === 'build') {
         extra.buildOk = false;
         if (site.mode === 'node') await stopApp(siteId);
@@ -496,9 +535,132 @@ function primaryRedirect(site, req) {
   return p.origin + p.pathname.replace(/\/+$/, '') + (req.url || '/');
 }
 
+// ---------------------------------------------------------------- private sites
+// A private website only opens for people signed in to Pagemaster with view
+// access to the site. The admin panel and the sites live on different origins,
+// so sign-in is handed over with a short-lived signed ticket:
+//   site -> admin /auth/site -> (sign in) -> site /.pagemaster-auth?t=<ticket>
+// which sets a cookie for this site, tied to the Pagemaster session.
+const AUTH_PATH = '/.pagemaster-auth';
+const SITE_COOKIE = 'pm_site_auth';
+const usedTickets = new Set();
+
+function reqProto(req) {
+  const xf = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+  if (xf === 'https' || xf === 'http') return xf;
+  try { if (JSON.parse(req.headers['cf-visitor'] || '{}').scheme === 'https') return 'https'; } catch (_) {}
+  return 'http';
+}
+
+function adminBase(req) {
+  const pub = db().settings.publicUrl;
+  if (pub) return pub.replace(/\/+$/, '');
+  const host = String(req.headers.host || 'localhost').replace(/:\d+$/, '');
+  return `http://${host}:${config.ADMIN_PORT}`;
+}
+
+function makeTicket(siteId, userId, sess) {
+  const body = `t.${siteId}.${userId}.${sess}.${Date.now() + 60000}`;
+  return `${body}.${sign(body)}`;
+}
+
+function makeCookieValue(siteId, userId, sess) {
+  const body = `c.${siteId}.${userId}.${sess}.${Date.now() + config.SESSION_DAYS * 86400000}`;
+  return `${body}.${sign(body)}`;
+}
+
+// Returns the user if `value` is a valid ticket/cookie of `kind` for this site
+function checkSigned(value, kind, site) {
+  const parts = String(value || '').split('.');
+  if (parts.length !== 6 || parts[0] !== kind) return null;
+  const [, siteId, userId, sess, exp, sig] = parts;
+  if (siteId !== site.id || !(+exp > Date.now())) return null;
+  if (!verifySig(parts.slice(0, 5).join('.'), sig)) return null;
+  if (!auth.sessionAlive(sess)) return null; // signed out of Pagemaster
+  const user = db().users.find((u) => u.id === userId);
+  if (!user || !access.siteCan(user, site, 'view')) return null;
+  return { user, sess };
+}
+
+function cookieValues(req, name) {
+  const out = [];
+  const re = new RegExp('(?:^|;\\s*)' + name + '=([^;]+)', 'g');
+  let m;
+  while ((m = re.exec(String(req.headers.cookie || '')))) out.push(decodeURIComponent(m[1]));
+  return out;
+}
+
+function siteVisitor(req, site) {
+  for (const v of cookieValues(req, SITE_COOKIE)) {
+    const ok = checkSigned(v, 'c', site);
+    if (ok) return ok.user;
+  }
+  return null;
+}
+
+// Don't pass Pagemaster's own cookie on to the site's app
+function stripAuthCookie(req) {
+  if (!req.headers.cookie) return;
+  req.headers.cookie = req.headers.cookie.split(/;\s*/).filter((c) => !c.startsWith(SITE_COOKIE + '=')).join('; ');
+}
+
+function sendPage(res, status, title, text) {
+  res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex' });
+  res.end(`<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><body style="font-family:system-ui,sans-serif;text-align:center;padding:4em 1em;color:#555"><h1>${title}</h1><p>${text}</p></body>`);
+}
+
+// Returns true if the request was answered (redirect to sign in, ticket exchange, refusal)
+function guardPrivate(site, req, res) {
+  const prefix = req._pmPrefix || '';
+  const urlPath = (req.url || '/').split('?')[0];
+  if (urlPath === AUTH_PATH) {
+    const q = new URL(req.url, 'http://x').searchParams;
+    const t = q.get('t') || '';
+    const ok = !usedTickets.has(t) && checkSigned(t, 't', site);
+    if (ok) {
+      // single use: remember until it would have expired anyway
+      usedTickets.add(t);
+      setTimeout(() => usedTickets.delete(t), 65000).unref();
+    }
+    if (!ok) { sendPage(res, 403, 'Sign-in link expired', 'Go back and open the site again.'); return true; }
+    let back = q.get('return') || '/';
+    if (!back.startsWith('/') || back.startsWith('//')) back = '/';
+    const secure = reqProto(req) === 'https' ? '; Secure' : '';
+    res.writeHead(302, {
+      Location: back,
+      'Cache-Control': 'no-store',
+      'Set-Cookie': `${SITE_COOKIE}=${encodeURIComponent(makeCookieValue(site.id, ok.user.id, ok.sess))}; Path=${prefix || ''}/; HttpOnly; SameSite=Lax; Max-Age=${config.SESSION_DAYS * 86400}${secure}`,
+    });
+    res.end();
+    return true;
+  }
+  if (site.access !== 'private') return false;
+  if (siteVisitor(req, site)) { stripAuthCookie(req); return false; }
+  if (req.method !== 'GET' && req.method !== 'HEAD') { sendPage(res, 401, 'Private site', 'Sign in to Pagemaster to use this site.'); return true; }
+  const host = req.headers['x-forwarded-host'] || req.headers.host || '';
+  const callback = `${reqProto(req)}://${String(host).split(',')[0].trim()}${prefix}${AUTH_PATH}?return=${encodeURIComponent(req.originalUrl || req.url || '/')}`;
+  res.writeHead(302, { Location: `${adminBase(req)}/auth/site?site=${encodeURIComponent(site.id)}&cb=${encodeURIComponent(callback)}`, 'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex' });
+  res.end();
+  return true;
+}
+
+// Hostnames a sign-in ticket may be sent to for this site (checked by the admin side,
+// so a ticket can't be sent to someone else's server)
+function trustedHosts(site, req) {
+  const d = db();
+  const hosts = new Set(hostsFor(site, d.settings.sitesBaseDomain || ''));
+  for (const t of d.tunnels || []) for (const r of t.routes || []) if (r.siteId === site.id) hosts.add(r.hostname);
+  for (const u of [d.settings.sitesUrl, d.settings.publicUrl, site.primaryUrl]) {
+    try { if (u) hosts.add(new URL(u).hostname.toLowerCase()); } catch (_) {}
+  }
+  hosts.add(String(req.hostname || '').toLowerCase()); // same machine as the admin panel (LAN)
+  return hosts;
+}
+
 function serveSite(site, req, res) {
   req._pmPreview = isPreview(req);
   analytics.track(site, req, res);
+  if (guardPrivate(site, req, res)) return;
   const to = primaryRedirect(site, req);
   if (to) {
     res.writeHead(301, { Location: to, 'Cache-Control': 'no-store' });
@@ -641,6 +803,8 @@ function hostingHandler(req, res) {
 function hostingUpgrade(req, socket, head) {
   const r = resolve(req);
   if (!r || r.site.mode !== 'node' || !r.site.internalPort || r.site.enabled === false) return socket.destroy();
+  if (r.site.access === 'private' && !siteVisitor(req, r.site)) return socket.destroy();
+  stripAuthCookie(req);
   if (r.prefix) req.url = r.rest || '/';
   proxy.ws(req, socket, head, { target: `http://127.0.0.1:${r.site.internalPort}` });
 }
@@ -668,6 +832,8 @@ async function syncDedicatedServers() {
     srv.on('upgrade', (req, socket, head) => {
       const cur = db().sites.find((x) => x.id === s.id);
       if (!cur || cur.mode !== 'node' || !cur.internalPort) return socket.destroy();
+      if (cur.access === 'private' && !siteVisitor(req, cur)) return socket.destroy();
+      stripAuthCookie(req);
       proxy.ws(req, socket, head, { target: `http://127.0.0.1:${cur.internalPort}` });
     });
     await new Promise((resolveP) => {
@@ -694,16 +860,25 @@ async function create(input, ownerId) {
     ...data,
     ownerId: ownerId || null,
     members: [],
+    // New sites are private by default: website needs a Pagemaster sign-in,
+    // and only the owner / people it is shared with see it in the panel
+    access: input.access === 'public' ? 'public' : 'private',
+    panelVisibility: input.panelVisibility === 'public' ? 'public' : 'private',
     enabled: true,
     status: 'pending',
     webhookSecret: crypto.randomBytes(16).toString('hex'),
     createdAt: Date.now(),
   };
   if (site.mode === 'node') site.internalPort = await allocInternalPort(site.id);
+  try { ensureSiteKey(site); } catch (e) { console.error('[sites] ssh-keygen failed', e.message); }
+  if (site.credentialId === 'deploykey') {
+    // The key has to be added to the repository before the first clone can work
+    site.status = 'waiting';
+  }
   db().sites.push(site);
   save();
   await syncDedicatedServers();
-  deploy(site.id);
+  if (site.status !== 'waiting') deploy(site.id);
   return site;
 }
 
@@ -745,6 +920,7 @@ async function remove(siteId) {
   fs.rmSync(logFile(site) + '.1', { force: true });
   runtime.delete(siteId);
   analytics.removeSite(siteId);
+  removeSiteKey(site);
 }
 
 // Primary address: one of the site's URLs, chosen in the panel. Doesn't redeploy.
@@ -761,6 +937,15 @@ function setPrimary(siteId, input) {
     site.primaryUrl = '';
   }
   site.redirectToPrimary = !!(site.primaryUrl && input.redirectToPrimary);
+  save();
+  return site;
+}
+
+function setVisibility(siteId, input) {
+  const site = db().sites.find((s) => s.id === siteId);
+  if (!site) throw Object.assign(new Error('Site not found'), { status: 404 });
+  if (input.access !== undefined) site.access = input.access === 'public' ? 'public' : 'private';
+  if (input.panelVisibility !== undefined) site.panelVisibility = input.panelVisibility === 'public' ? 'public' : 'private';
   save();
   return site;
 }
@@ -817,7 +1002,7 @@ async function startAll() {
   checkStorage();
   await syncDedicatedServers();
   for (const s of d.sites) {
-    if (s.enabled === false) continue;
+    if (s.enabled === false || s.status === 'waiting') continue;
     if (!fs.existsSync(path.join(repoDir(s), '.git'))) { deploy(s.id); continue; }
     if (s.mode === 'node' && !buildReady(s)) {
       deploy(s.id);
@@ -830,7 +1015,7 @@ async function startAll() {
   setInterval(() => {
     const now = Date.now();
     for (const s of db().sites) {
-      if (!s.autoPullMinutes || s.enabled === false) continue;
+      if (!s.autoPullMinutes || s.enabled === false || s.status === 'waiting') continue;
       if (now - (s.lastCheck || 0) >= s.autoPullMinutes * 60000) deploy(s.id, { onlyIfChanged: true });
     }
   }, 60000).unref();
@@ -841,7 +1026,8 @@ async function shutdown() {
 }
 
 module.exports = {
-  create, update, remove, deploy, setEnabled, setPrimary, info, readLog, startAll, shutdown,
+  create, update, remove, deploy, setEnabled, setPrimary, setVisibility, info,
+  ensureSiteKey, makeTicket, trustedHosts, AUTH_PATH, readLog, startAll, shutdown,
   hostingHandler, hostingUpgrade, repoDir, slugify,
   checkStorage, getStorageCheck: () => storageCheck, STORAGE_FIX,
 };

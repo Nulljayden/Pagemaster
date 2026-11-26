@@ -94,7 +94,8 @@
     clearInterval(state.timer);
     const params = new URLSearchParams(location.search);
     const err = params.get('error');
-    if (err) history.replaceState(null, '', '/');
+    const next = nextUrl();
+    if (err) history.replaceState(null, '', next ? '/?next=' + encodeURIComponent(next) : '/');
     let pub = { sso: { enabled: false } };
     try { pub = await api('GET', '/api/public', undefined, { allow401: true }); } catch (_) {}
     app.innerHTML = `
@@ -108,7 +109,8 @@
           <label class="field"><span>Password</span><input type="password" name="password" autocomplete="current-password" required></label>
           <button class="btn primary block" type="submit">Sign in</button>
         </form>
-        ${pub.sso.enabled ? `<div class="divider">or</div><a class="btn block" href="/auth/sso/login">${esc(pub.sso.label)}</a>` : ''}
+        ${next ? '<div class="alert info small">Sign in to open a private site.</div>' : ''}
+        ${pub.sso.enabled ? `<div class="divider">or</div><a class="btn block" href="/auth/sso/login${next ? '?next=' + encodeURIComponent(next) : ''}">${esc(pub.sso.label)}</a>` : ''}
       </div></div>`;
     $('#login-form').onsubmit = async (e) => {
       e.preventDefault();
@@ -119,6 +121,12 @@
         $('#login-err').innerHTML = `<div class="alert error">${esc(ex.message)}</div>`;
       }
     };
+  }
+
+  // After signing in, continue to a private site that sent us here
+  function nextUrl() {
+    const n = new URLSearchParams(location.search).get('next') || '';
+    return n.startsWith('/auth/site?') ? n : '';
   }
 
   // ------------------------------------------------------------------ shell
@@ -146,6 +154,7 @@
     } catch (_) {
       return renderLogin();
     }
+    if (nextUrl()) { location.href = nextUrl(); return; }
     renderShell();
     const qs = new URLSearchParams(location.search);
     if (qs.get('error')) toast(qs.get('error'), 'error');
@@ -280,6 +289,8 @@
           <h3>${esc(s.name)}</h3>
           <span class="badge ${esc(status)}">${esc(status)}</span>
           <span class="tag">${s.mode === 'node' ? 'App' : 'Static'}</span>
+          ${s.access === 'private' ? '<span class="tag" title="Website: only signed-in Pagemaster users with access can open it">🔒 Private</span>' : '<span class="tag" title="Website: anyone with the address can open it">🌐 Public</span>'}
+          ${s.panelVisibility === 'public' ? '<span class="tag" title="Every Pagemaster user can see this site in the panel">visible to all users</span>' : ''}
           ${s.autoPullMinutes ? `<span class="tag">auto-pull ${s.autoPullMinutes}m</span>` : ''}
           ${my.owner ? '' : `<span class="tag" title="Owner">👤 ${esc(s.ownerName)}</span>`}
           ${(s.members || []).length ? `<span class="tag" title="Shared with ${esc(s.members.map((m) => m.username).join(', '))}">shared · ${s.members.length}</span>` : ''}
@@ -291,6 +302,7 @@
           <div><span class="k">Commit</span>${esc(s.lastCommit || '—')} <span class="muted small">· ${fmtTime(s.lastDeploy)}</span></div>
           <div><span class="k">Last 7 days</span><a href="#" data-act="analytics">${fmtNum(st.visitors)} visitors · ${fmtNum(st.pageviews)} page views</a></div>
           ${s.lastError ? `<div class="err small">${esc(s.lastError)}</div>` : ''}
+          ${s.status === 'waiting' ? `<div class="small">Waiting for the deploy key to be added to the repository.${my.manage ? ' <a href="#" data-act="deploykey">Show the key</a>' : ''}</div>` : ''}
         </div>
         <div class="row site-actions">
           <button class="btn sm" data-act="preview">👁 Preview</button>
@@ -392,6 +404,8 @@
       if (act === 'analytics') { showAnalytics(s); return; }
       if (act === 'settings') { siteSettings(s); return; }
       if (act === 'addresses') { addressesForm(s); return; }
+      if (act === 'visibility') { visibilityForm(s); return; }
+      if (act === 'deploykey') { deployKeyModal(s); return; }
       if (act === 'share') { shareForm(s); return; }
       if (act === 'transfer') { transferForm(s); return; }
       if (act === 'delete') {
@@ -450,6 +464,8 @@
       <div class="settings-list">
         ${my.manage ? item('edit', 'Edit site', 'Repository, build and start commands, custom domains, port. Saving redeploys.') : ''}
         ${my.manage ? item('addresses', 'Primary address', 'Choose which URL is the main one, and optionally redirect the others to it.') : ''}
+        ${my.manage ? item('visibility', 'Visibility', `Website: <b>${s.access === 'private' ? 'private' : 'public'}</b> · In Pagemaster: <b>${s.panelVisibility === 'public' ? 'all users' : 'private'}</b>`) : ''}
+        ${my.manage ? item('deploykey', 'Deploy key', 'This site\'s own SSH key, to add as a read-only deploy key on the repository.') : ''}
         ${my.manage ? item('webhook', 'Deploy webhook', 'URL your git host calls on every push.') : ''}
         ${my.share ? item('share', 'Sharing', 'Give other users access to just this site.') : ''}
         ${my.transfer ? item('transfer', 'Transfer ownership', 'Hand the site to another user.') : ''}
@@ -458,6 +474,82 @@
       <div class="modal-foot"><button class="btn" data-close>Close</button></div>`, {
       onMount: (m, close) => {
         $$('[data-go]', m).forEach((b) => { b.onclick = () => { close(); siteAction(b.dataset.go, s); }; });
+      },
+    });
+  }
+
+  function visibilityFields(s, canPanel = true) {
+    const r = (name, val, cur, title, text) => `<label class="check"><input type="radio" name="${name}" value="${val}" ${cur === val ? 'checked' : ''} ${name === 'panelVisibility' && !canPanel ? 'disabled' : ''}> <span><b>${title}</b><br><span class="muted small">${text}</span></span></label>`;
+    return `<div class="grid2">
+      <div><h3>Website</h3>
+        ${r('access', 'private', s.access || 'private', '🔒 Private', 'Visitors must sign in to Pagemaster and have access to this site.')}
+        ${r('access', 'public', s.access || 'private', '🌐 Public', 'Anyone with the address can open it.')}</div>
+      <div><h3>In Pagemaster</h3>
+        ${r('panelVisibility', 'private', s.panelVisibility || 'private', 'Private', 'Only the owner, people it is shared with, and admins see it.')}
+        ${r('panelVisibility', 'public', s.panelVisibility || 'private', 'All users', 'Every Pagemaster user can see it (status, logs, analytics), and open it if the website is private.')}</div>
+    </div>`;
+  }
+
+  function visibilityForm(s) {
+    const canPanel = !!(s.my && s.my.share);
+    modal(`<h2>Visibility: ${esc(s.name)}</h2>
+      <form id="vis-form">${visibilityFields(s, canPanel)}
+        ${canPanel ? '' : '<p class="muted small">Only the owner or an admin can change who sees the site in Pagemaster.</p>'}
+        <div class="alert info small">Private websites send visitors to Pagemaster to sign in${state.system && !state.system.publicUrl ? '. Set <b>Settings → Public URL</b> so that works from outside your network (tunnels, domains)' : ''}. Signing out of Pagemaster signs them out of private sites too.</div>
+        <div class="modal-foot"><button type="button" class="btn" data-close>Cancel</button><button class="btn primary">Save</button></div>
+      </form>`, {
+      onMount: (m, close) => {
+        $('#vis-form', m).onsubmit = async (e) => {
+          e.preventDefault();
+          const body = { access: $('[name=access]:checked', m).value };
+          if (canPanel) body.panelVisibility = $('[name=panelVisibility]:checked', m).value;
+          try { await api('PUT', `/api/sites/${s.id}/visibility`, body); toast('Visibility saved', 'ok'); close(); refreshSites(); }
+          catch (ex) { toast(ex.message, 'error'); }
+        };
+      },
+    });
+  }
+
+  // Where to add a deploy key, for the common hosts
+  function deployKeyPage(repoUrl) {
+    const m = String(repoUrl || '').match(/^(?:[\w.-]+@|ssh:\/\/[\w.-]+@|https?:\/\/)([^/:]+)(?::\d+)?[:/](.+?)(?:\.git)?\/?$/);
+    if (!m) return null;
+    const [, host, repo] = m;
+    if (host === 'github.com') return { url: `https://github.com/${repo}/settings/keys/new`, where: 'GitHub → repository → Settings → Deploy keys → Add deploy key' };
+    if (host === 'gitlab.com') return { url: `https://gitlab.com/${repo}/-/settings/repository`, where: 'GitLab → project → Settings → Repository → Deploy keys' };
+    if (host === 'bitbucket.org') return { url: `https://bitbucket.org/${repo}/admin/access-keys/`, where: 'Bitbucket → repository settings → Access keys' };
+    if (host === 'codeberg.org') return { url: `https://codeberg.org/${repo}/settings/keys`, where: 'Codeberg → repository → Settings → Deploy keys' };
+    return { url: '', where: 'your git host: repository settings → Deploy keys (Gitea/Forgejo/GitLab) ' };
+  }
+
+  async function deployKeyModal(s, first = false) {
+    let k;
+    try { k = await api('GET', `/api/sites/${s.id}/deploy-key`); } catch (e) { return toast(e.message, 'error'); }
+    const page = deployKeyPage(s.repoUrl);
+    modal(`<h2>${first ? 'One more step: add the deploy key' : 'Deploy key: ' + esc(s.name)}</h2>
+      <p>${first ? 'Pagemaster made an SSH key just for this site. ' : ''}Add this public key to the repository as a <b>read-only deploy key</b>${page ? ` in <b>${esc(page.where)}</b>` : ''}. Leave "allow write access" off.</p>
+      <textarea readonly rows="3" class="mono" id="dk">${esc(k.publicKey)}</textarea>
+      <div class="row" style="margin-top:8px">
+        <button class="btn" id="dk-copy">Copy key</button>
+        ${page && page.url ? `<a class="btn" href="${esc(page.url)}" target="_blank" rel="noopener">Open deploy key settings ↗</a>` : ''}
+        <button class="btn danger" id="dk-regen">Regenerate</button>
+      </div>
+      ${k.inUse ? `<p class="muted small">This site clones <span class="mono">${esc(s.repoUrl)}</span> with this key.</p>`
+        : `<div class="alert info small">This site doesn't use its deploy key yet (it uses ${s.credentialId === 'none' ? 'no credentials' : s.credentialId === 'auto' ? 'a token matched by host, or the shared SSH key' : 'a git token'}). After adding the key, click <b>Use this key</b>. HTTPS repository URLs are switched to SSH automatically.</div>`}
+      <div class="modal-foot"><button class="btn" data-close>Close</button>
+        ${k.inUse ? '<button class="btn primary" id="dk-deploy">I\'ve added it: deploy now</button>' : '<button class="btn primary" id="dk-use">Use this key &amp; deploy</button>'}</div>`, {
+      onMount: (m, close) => {
+        $('#dk-copy', m).onclick = () => navigator.clipboard.writeText($('#dk', m).value).then(() => toast('Copied', 'ok'));
+        $('#dk-regen', m).onclick = async () => {
+          if (!(await confirmBox('Regenerate the key? The old one stops working, so replace it on the repository too.', 'Regenerate'))) return;
+          try { $('#dk', m).value = (await api('POST', `/api/sites/${s.id}/deploy-key/regenerate`)).publicKey; toast('New key made: update it on the repository', 'ok'); } catch (e) { toast(e.message, 'error'); }
+        };
+        if ($('#dk-deploy', m)) $('#dk-deploy', m).onclick = async () => {
+          try { await api('POST', `/api/sites/${s.id}/deploy`); toast('Deploy started'); close(); refreshSites(); } catch (e) { toast(e.message, 'error'); }
+        };
+        if ($('#dk-use', m)) $('#dk-use', m).onclick = async () => {
+          try { await api('PUT', `/api/sites/${s.id}`, { credentialId: 'deploykey' }); toast('Switched to the deploy key, deploying', 'ok'); close(); refreshSites(); } catch (e) { toast(e.message, 'error'); }
+        };
       },
     });
   }
@@ -710,8 +802,9 @@
           <label class="field"><span>Git credential</span><select name="credentialId">
             <option value="auto" ${s.credentialId === 'auto' ? 'selected' : ''}>Auto (match by host)</option>
             <option value="none" ${s.credentialId === 'none' ? 'selected' : ''}>None (public repo)</option>
+            <option value="deploykey" ${s.credentialId === 'deploykey' ? 'selected' : ''}>Deploy key for this site (SSH)</option>
             ${creds.map((c) => `<option value="${esc(c.id)}" ${s.credentialId === c.id ? 'selected' : ''}>${esc(c.name)} (${esc(c.host)})</option>`).join('')}
-          </select></label>
+          </select><small id="cred-help"></small></label>
         </div>
         <div class="grid2">
           <label class="field"><span>Type</span><select name="mode" id="mode">
@@ -732,6 +825,7 @@
         <label class="field"><span>Environment variables</span><textarea name="env" rows="3" placeholder="KEY=value (one per line)">${esc(s.env)}</textarea>
           <small>Available to install/build/start commands.</small></label>
         <label class="check"><input type="checkbox" name="spa" ${s.spa ? 'checked' : ''}> <span>Single-page app — serve <code>index.html</code> for unknown paths (React/Vue router etc.)</span></label>
+        ${editing ? '' : `<div class="card" style="padding:12px 14px;margin:12px 0">${visibilityFields(s)}</div>`}
         <details class="adv" ${(s.domains || []).length || s.port ? 'open' : ''}><summary>Advanced: custom domains &amp; dedicated port</summary>
           <label class="field"><span>Custom domains</span><input type="text" name="domains" value="${esc((s.domains || []).join(', '))}" placeholder="www.example.com, example.com">
             <small>Hostnames you point at this server yourself (DNS / reverse proxy). For Cloudflare, use the <b>Tunnels</b> page instead. Each domain can only belong to one site.${sys.sitesBaseDomain ? ` Also served at <b>${esc(s.slug || 'slug')}.${esc(sys.sitesBaseDomain)}</b>.` : ''}</small></label>
@@ -745,17 +839,36 @@
         const toggle = () => { $('#start-field', m).style.display = $('#mode', m).value === 'node' ? '' : 'none'; };
         $('#mode', m).onchange = toggle;
         toggle();
+        const cred = $('[name=credentialId]', m);
+        const repo = $('[name=repoUrl]', m);
+        const credHelp = () => {
+          $('#cred-help', m).textContent = cred.value === 'deploykey'
+            ? (editing ? 'Uses this site\'s own SSH key. HTTPS URLs are switched to SSH.' : 'Pagemaster makes an SSH key for this site and shows it after you click Add, so you can add it to the repository before the first deploy.')
+            : '';
+        };
+        cred.onchange = credHelp;
+        // SSH URLs on a new site: default to a per-site deploy key
+        repo.addEventListener('input', () => {
+          if (!editing && cred.value === 'auto' && /^(ssh:\/\/|[\w.-]+@[\w.-]+:)/.test(repo.value.trim())) { cred.value = 'deploykey'; credHelp(); }
+        });
+        credHelp();
         $('#site-form', m).onsubmit = async (e) => {
           e.preventDefault();
           const btn = $('button.primary', m);
           btn.disabled = true;
           try {
             const body = formData(e.target);
-            if (editing) await api('PUT', `/api/sites/${s.id}`, body);
-            else await api('POST', '/api/sites', body);
+            if (!editing) {
+              body.access = $('[name=access]:checked', m).value;
+              body.panelVisibility = $('[name=panelVisibility]:checked', m).value;
+            }
+            let saved;
+            if (editing) saved = await api('PUT', `/api/sites/${s.id}`, body);
+            else saved = await api('POST', '/api/sites', body);
             state.system = await api('GET', '/api/system');
-            toast(editing ? 'Saved — redeploying' : 'Site added — deploying', 'ok');
             close();
+            if (!editing && saved.status === 'waiting') deployKeyModal(saved, true);
+            else toast(editing ? 'Saved — redeploying' : 'Site added — deploying', 'ok');
             if (state.page === 'sites') renderSiteList(await api('GET', '/api/sites'));
           } catch (ex) {
             $('#site-err', m).innerHTML = `<div class="alert error" style="white-space:pre-wrap">${esc(ex.message)}</div>`;
@@ -1455,7 +1568,7 @@
         <label class="field"><span>Redirect URI (add this in your provider)</span><input type="text" readonly value="${esc(s.ssoRedirectUri)}" class="mono"></label>
         <label class="check"><input type="checkbox" name="sso_autoCreate" ${s.sso.autoCreate ? 'checked' : ''}> <span>Automatically create accounts for new SSO users</span></label>
         <h3 style="margin-top:14px">Default permissions for new SSO users</h3>
-        <p class="muted small">New SSO users get only these until an admin changes them in <b>Users</b>. Lowest access (just <code>sites.view</code>) is recommended.</p>
+        <p class="muted small">New SSO users get only these until an admin changes them in <b>Users</b>. Leave them all off to give new users nothing but the sites shared with them (or set to "All users" in the panel).</p>
         ${permChecks(s.sso.defaultPermissions, 'sso_defaultPermissions')}
       </div>
       <button class="btn primary">Save settings</button>

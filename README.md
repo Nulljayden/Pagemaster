@@ -11,6 +11,8 @@ A self-hosted control panel for hosting websites straight from git repositories.
 - **User management** with fine-grained permissions. The default login is **`admin` / `admin`**, and you get a prompt to change it on first sign-in.
 - **Site ownership & sharing.** Every site has an owner who can share it with individual users (view, deploy, manage, files) or transfer it to someone else.
 - **Built-in analytics** per site: visitors, page views, top pages, referrers, countries, status codes and bandwidth. No cookies or tracking script.
+- **Deploy keys per site.** Every site gets its own SSH key. Pick *Deploy key for this site* when adding it, paste the key into the repo's deploy keys, done.
+- **Private or public**, per site: a private website asks visitors to sign in to Pagemaster first, and a private site is hidden in the panel from users it isn't shared with. New sites are private on both.
 - **Primary address.** When a site has several URLs, pick the main one and optionally redirect the others to it.
 - **SSO (OpenID Connect)** for Authentik, Authelia, Keycloak, Zitadel, Pocket ID, Google, Entra ID and others. Local login stays available. New SSO users get the **lowest access** (`sites.view` only) until an admin raises it.
 - **Slug URLs, no ports.** Every site lives at `http://server/<slug>/`. Apps that redirect to `/login` or link to `/assets/...` still work under the slug: redirects and cookies are rewritten, and absolute links get routed back into the right site.
@@ -193,6 +195,11 @@ Signing in with SSO for the first time creates a new user. To use SSO with the a
 - **⚙ Settings → Sharing** gives other users access to just that site: `view` (status, logs, analytics), `deploy`, `manage` (edit, addresses, webhook), `files.read` and `files.write`. Global permissions in **Users** still apply to every site. Note that `manage` lets someone change build/start commands, which run inside the container.
 - **⚙ Settings → Transfer ownership** hands a site to another user (owner or admin only), optionally keeping your access. Tunnels have a **Transfer** button too. Deleting a user moves their sites to the admin who deleted them.
 - **⚙ Settings → Primary address** picks which URL is shown first. Optionally all other hostnames get a 301 redirect to it.
+- **Visibility** (⚙ Settings → Visibility, or when adding a site) has two switches, both *private* for new sites:
+  - **Website:** *private* means visitors are sent to Pagemaster to sign in and need view access to the site; *public* means anyone with the address. Sign-in is handed back to the site with a one-time ticket and a cookie for that site only, so it works across ports, domains and Cloudflare tunnels. Set **Settings → Public URL** so the sign-in page is reachable from wherever visitors come from. Signing out of Pagemaster signs them out of private sites too. Sites that existed before this feature stay public.
+  - **In Pagemaster:** *private* means only the owner, people it is shared with, and admins (or users with the global `sites.*` permissions) see it; *all users* lets every Pagemaster user see it.
+  - New SSO users get no global permissions by default, so they only see what is shared with them or visible to all users.
+- **Deploy keys:** every site has its own SSH key (⚙ Settings → Deploy key). Choose *Deploy key for this site (SSH)* as the git credential when adding a site; Pagemaster shows the key, with a link to the repository's deploy key page on GitHub, GitLab, Bitbucket and Codeberg, and waits for you to click **deploy now**. HTTPS URLs are switched to SSH automatically. The shared SSH key under Git Credentials still works for existing sites.
 - **📊 Analytics** shows visitors, page views, requests, bandwidth, error rate, top pages, referrers, countries (via Cloudflare) and which address people used. It is counted from the requests Pagemaster serves, with no cookies and no script added to your site. Data is kept for 400 days in `/data/analytics.json`.
 
 ## Cloudflare Tunnels (per user)

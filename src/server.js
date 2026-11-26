@@ -54,6 +54,27 @@ app.post('/hooks/:id/:secret', (req, res) => {
 
 // ------------------------------------------------------------------ auth
 sso.register(app);
+
+// Sign-in handover for private websites (see sites.js "private sites")
+function plainPage(res, status, title, text) {
+  res.status(status).set('Cache-Control', 'no-store').type('html').send(`<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><body style="font-family:system-ui,sans-serif;text-align:center;padding:4em 1em;color:#555"><h1>${title}</h1><p>${text}</p><p><a href="/">Open Pagemaster</a></p></body>`);
+}
+app.get('/auth/site', (req, res) => {
+  const site = db().sites.find((s) => s.id === req.query.site);
+  if (!site) return plainPage(res, 404, 'Site not found', 'This site no longer exists.');
+  let cb;
+  try { cb = new URL(String(req.query.cb || '')); } catch (_) { cb = null; }
+  const okPath = cb && (cb.pathname === sites.AUTH_PATH || cb.pathname === `/${site.slug}${sites.AUTH_PATH}`);
+  if (!cb || !/^https?:$/.test(cb.protocol) || !okPath || !sites.trustedHosts(site, req).has(cb.hostname.toLowerCase())) {
+    return plainPage(res, 400, 'Unknown address', 'Pagemaster does not know this address for the site. Open the site through one of its own addresses.');
+  }
+  if (!req.user) return res.redirect('/?next=' + encodeURIComponent(req.originalUrl));
+  if (!access.siteCan(req.user, site, 'view')) {
+    return plainPage(res, 403, 'No access', `You are signed in as <b>${req.user.username.replace(/[<>&"]/g, '')}</b>, but "${site.name.replace(/[<>&"]/g, '')}" is private and hasn't been shared with you.`);
+  }
+  cb.searchParams.set('t', sites.makeTicket(site.id, req.user.id, auth.sessionKey(req)));
+  res.set('Cache-Control', 'no-store').redirect(cb.toString());
+});
 app.use('/api', (_req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
 app.use('/api', auth.csrfGuard);
 
@@ -133,6 +154,7 @@ app.get('/api/system', auth.requireAuth, (_req, res) => {
     hostingPort: config.HOSTING_PORT,
     hostingPublicPort: config.HOSTING_PUBLIC_PORT,
     sitesUrl: d.settings.sitesUrl || '',
+    publicUrl: d.settings.publicUrl || '',
     sitePortRange: config.SITE_PORT_RANGE,
     usedPorts: d.sites.filter((s) => s.port).map((s) => ({ port: s.port, site: s.name })),
     sitesBaseDomain: d.settings.sitesBaseDomain || '',
@@ -189,6 +211,7 @@ app.delete('/api/sites/:id', S('share'), wrap(async (req, res) => {
   res.json({ ok: true });
 }));
 app.post('/api/sites/:id/deploy', S('deploy'), (req, res) => {
+  if (req.site.status === 'waiting') { req.site.status = 'pending'; save(); }
   sites.deploy(req.params.id);
   res.json({ ok: true });
 });
@@ -207,6 +230,24 @@ app.post('/api/sites/:id/webhook/rotate', S('manage'), (req, res) => {
 });
 app.get('/api/sites/:id/log', S('view'), (req, res) => {
   res.type('text/plain').send(sites.readLog(req.site));
+});
+
+// Website / panel visibility
+app.put('/api/sites/:id/visibility', S('manage'), json, (req, res) => {
+  const b = req.body || {};
+  // Making a site visible to every user is a sharing decision
+  if (b.panelVisibility !== undefined && b.panelVisibility !== req.site.panelVisibility && !access.canShare(req.user, req.site)) {
+    return res.status(403).json({ error: 'Only the owner or an admin can change who sees this site in Pagemaster' });
+  }
+  res.json(siteOut(req, sites.setVisibility(req.params.id, b)));
+});
+
+// Per-site SSH deploy key
+app.get('/api/sites/:id/deploy-key', S('manage'), (req, res) => {
+  res.json({ publicKey: sites.ensureSiteKey(req.site), inUse: req.site.credentialId === 'deploykey' });
+});
+app.post('/api/sites/:id/deploy-key/regenerate', S('manage'), (req, res) => {
+  res.json({ publicKey: sites.ensureSiteKey(req.site, true), inUse: req.site.credentialId === 'deploykey' });
 });
 
 // Primary address (+ optional redirect of the other addresses to it)

@@ -29,6 +29,7 @@ function siteCan(user, site, perm) {
   if (!user || user.disabled || !site) return false;
   if (user.isAdmin || isOwner(user, site)) return true;
   if ((user.permissions || []).includes(GLOBAL[perm])) return true;
+  if (perm === 'view' && site.panelVisibility === 'public') return true;
   const m = member(site, user);
   if (!m || !m.perms.length) return false;
   if (m.perms.includes(perm)) return true;

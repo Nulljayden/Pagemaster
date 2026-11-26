@@ -39,7 +39,7 @@ function resetClient() {
 
 // Starts an authorization request. `linkUserId` set = link this SSO identity to
 // that (already signed-in) account instead of signing in.
-async function authorizationUrl(req, linkUserId) {
+async function authorizationUrl(req, linkUserId, next) {
   const s = settings().sso;
   const client = await getClient(req);
   const state = generators.state();
@@ -47,7 +47,7 @@ async function authorizationUrl(req, linkUserId) {
   const verifier = generators.codeVerifier();
   const now = Date.now();
   for (const [k, v] of pending) if (v.expires < now) pending.delete(k);
-  pending.set(state, { verifier, nonce, expires: now + 10 * 60000, linkUserId: linkUserId || null });
+  pending.set(state, { verifier, nonce, expires: now + 10 * 60000, linkUserId: linkUserId || null, next: safeNext(next) });
   return client.authorizationUrl({
     scope: s.scopes || 'openid profile email',
     state,
@@ -55,6 +55,11 @@ async function authorizationUrl(req, linkUserId) {
     code_challenge: generators.codeChallenge(verifier),
     code_challenge_method: 'S256',
   });
+}
+
+// Only continue to Pagemaster's own private-site handover after sign-in
+function safeNext(next) {
+  return typeof next === 'string' && next.startsWith('/auth/site?') ? next : '';
 }
 
 function enabled() {
@@ -66,7 +71,7 @@ function register(app) {
   app.get('/auth/sso/login', async (req, res) => {
     if (!enabled()) return res.redirect('/?error=' + encodeURIComponent('SSO is not configured'));
     try {
-      res.redirect(await authorizationUrl(req));
+      res.redirect(await authorizationUrl(req, null, req.query.next));
     } catch (e) {
       console.error('[sso] login error', e.message);
       res.redirect('/?error=' + encodeURIComponent('SSO error: ' + e.message));
@@ -101,7 +106,7 @@ function register(app) {
       if (!user) throw new Error('No account for this SSO user (auto-create is disabled)');
       if (user.disabled) throw new Error('Account disabled');
       auth.createSession(res, user);
-      res.redirect('/');
+      res.redirect(p.next || '/');
     } catch (e) {
       console.error('[sso] callback error', e.message);
       res.redirect('/?error=' + encodeURIComponent('SSO error: ' + e.message));
@@ -153,7 +158,7 @@ function upsertSsoUser(claims) {
       ssoSubject: subject,
       isAdmin: false,
       // Lowest access until an admin changes it
-      permissions: Array.isArray(s.defaultPermissions) ? s.defaultPermissions.slice() : ['sites.view'],
+      permissions: Array.isArray(s.defaultPermissions) ? s.defaultPermissions.slice() : [],
       mustChangePassword: false,
       disabled: false,
       createdAt: Date.now(),

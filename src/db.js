@@ -9,9 +9,9 @@ const DB_FILE = path.join(config.DATA_DIR, 'pagemaster.json');
 const KEY_FILE = path.join(config.DATA_DIR, 'secret.key');
 
 const PERMISSIONS = {
-  'sites.view': 'View sites and their status/logs',
-  'sites.deploy': 'Pull / redeploy / start / stop sites',
-  'sites.manage': 'Add, edit and delete sites',
+  'sites.view': 'View every site (including private ones), its status, logs and analytics',
+  'sites.deploy': 'Pull / redeploy / start / stop every site',
+  'sites.manage': 'Add sites; edit and delete every site',
   'credentials.manage': 'Manage git tokens and SSH key',
   'files.read': 'Browse and download files',
   'files.write': 'Upload, edit, rename and delete files',
@@ -33,8 +33,9 @@ const DEFAULT_SETTINGS = {
     clientSecret: '',
     scopes: 'openid profile email',
     autoCreate: true,
-    // SSO users get the lowest access until an admin changes it
-    defaultPermissions: ['sites.view'],
+    // SSO users get no global access until an admin changes it; they still see
+    // sites shared with them and sites set to "public in the panel"
+    defaultPermissions: [],
   },
 };
 
@@ -71,6 +72,17 @@ function decrypt(blob) {
   return Buffer.concat([d.update(Buffer.from(enc, 'hex')), d.final()]).toString('utf8');
 }
 
+// HMAC signature (base64url) with the instance secret, for signed tickets/cookies
+function sign(text) {
+  return crypto.createHmac('sha256', getKey()).update(String(text)).digest('base64url');
+}
+
+function verifySig(text, sig) {
+  const a = Buffer.from(sign(text));
+  const b = Buffer.from(String(sig || ''));
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
 function load() {
   ensureDirs();
   if (fs.existsSync(DB_FILE)) {
@@ -91,6 +103,9 @@ function load() {
   const firstAdmin = state.users.find((u) => u.isAdmin && !u.disabled) || state.users.find((u) => u.isAdmin);
   for (const s of state.sites) {
     if (!Array.isArray(s.members)) s.members = [];
+    // Sites from before visibility existed keep working as they did: public website, private in the panel
+    if (!s.access) s.access = 'public';
+    if (!s.panelVisibility) s.panelVisibility = 'private';
     if ((!s.ownerId || !state.users.some((u) => u.id === s.ownerId)) && firstAdmin) s.ownerId = firstAdmin.id;
   }
 
@@ -116,4 +131,4 @@ function id() {
   return crypto.randomBytes(8).toString('hex');
 }
 
-module.exports = { db, load, save, id, encrypt, decrypt, PERMISSIONS };
+module.exports = { db, load, save, id, encrypt, decrypt, sign, verifySig, PERMISSIONS };
