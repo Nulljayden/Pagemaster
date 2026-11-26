@@ -10,16 +10,14 @@ services:
     restart: unless-stopped
     environment:
       - TZ=Etc/UTC
-      - ADMIN_PORT=8080            # admin web UI
-      - HOSTING_PORT=8081          # sites, inside the container
-      - HOSTING_PUBLIC_PORT=80     # host port the sites are published on (80 = http://server/<slug>/)
-      - SITE_PORT_RANGE=8100-8199  # optional per-site ports (Advanced; usually not needed)
+      - ADMIN_PORT=38080           # admin web UI
+      - HOSTING_PORT=38081         # all sites: http://server:38081/<slug>/ (and Cloudflare tunnels)
       # - TRUST_PROXY=true         # set when behind a reverse proxy (Nginx Proxy Manager, Traefik, Caddy...)
       # - COOKIE_SECURE=true       # set when the admin UI is only reached over HTTPS
     ports:
-      - "8080:8080"                # admin UI
-      - "80:8081"                  # sites: http://server/<slug>/
-      # - "8100-8199:8100-8199"    # only if you use dedicated site ports
+      - "38080:38080"              # admin UI
+      - "38081:38081"              # sites
+      # - "8100-8199:8100-8199"    # only if you use dedicated site ports (Advanced)
     volumes:
       # TrueNAS: change to a dataset path, e.g. /mnt/tank/apps/pagemaster:/data
       - ./data:/data

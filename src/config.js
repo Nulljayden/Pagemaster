@@ -16,11 +16,11 @@ module.exports = {
   LOGS_DIR: path.join(DATA_DIR, 'logs'),
   SSH_DIR: path.join(DATA_DIR, 'ssh'),
   // Admin web UI
-  ADMIN_PORT: parseInt(process.env.ADMIN_PORT || '8080', 10),
+  ADMIN_PORT: parseInt(process.env.ADMIN_PORT || '38080', 10),
   // Shared hosting port (routes by hostname or /<slug>/ path)
-  HOSTING_PORT: parseInt(process.env.HOSTING_PORT || '8081', 10),
-  // Port the hosting port is published on outside the container (80 = no port in URLs)
-  HOSTING_PUBLIC_PORT: parseInt(process.env.HOSTING_PUBLIC_PORT || process.env.HOSTING_PORT || '8081', 10),
+  HOSTING_PORT: parseInt(process.env.HOSTING_PORT || '38081', 10),
+  // Host port the sites are published on, if it differs from HOSTING_PORT (used for links in the UI)
+  HOSTING_PUBLIC_PORT: parseInt(process.env.HOSTING_PUBLIC_PORT || process.env.HOSTING_PORT || '38081', 10),
   // Cloudflare tunnels
   CLOUDFLARED_BIN: process.env.CLOUDFLARED_BIN || 'cloudflared',
   CF_API_BASE: process.env.CF_API_BASE || 'https://api.cloudflare.com/client/v4',

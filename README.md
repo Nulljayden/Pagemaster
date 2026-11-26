@@ -21,17 +21,17 @@ A self-hosted control panel for hosting websites straight from git repositories.
 
 | Container port | Published as | Purpose |
 |---|---|---|
-| `8080` | `8080` | Admin web UI (`ADMIN_PORT`) |
-| `8081` | **`80`** | All sites (`HOSTING_PORT`), at **`http://server/<slug>/`** |
+| `38080` | `38080` | Admin web UI (`ADMIN_PORT`) |
+| `38081` | `38081` | All sites (`HOSTING_PORT`), at **`http://server:38081/<slug>/`**, and where Cloudflare tunnels deliver traffic |
 | `8100-8199` | *(not published by default)* | Optional dedicated per-site ports (Advanced, rarely needed) |
 
-`HOSTING_PUBLIC_PORT` tells Pagemaster which host port the sites are published on, so the links it shows match. With `80` the links have no port. App-type sites also get an internal loopback port (`20000-20999`), assigned automatically, never shared, and passed to the app as `$PORT`.
+Keep the container port and the published port the same (`38081:38081`). If you do publish on a different host port, set `HOSTING_PUBLIC_PORT` to it so the links in the UI match. With Cloudflare Tunnels the port never shows up anywhere public: visitors use `https://<sub>.yourdomain.com`. App-type sites also get an internal loopback port (`20000-20999`), assigned automatically, never shared, and passed to the app as `$PORT`.
 
 ### Ways to reach a site
 
-1. **Slug (default):** `http://SERVER/<slug>/`. Works right away, with no DNS needed.
+1. **Slug (local):** `http://SERVER:38081/<slug>/`. Works right away on your LAN, with no DNS needed.
 2. **Cloudflare Tunnel:** `https://<slug>.yourdomain.com` from anywhere, with no port-forwarding. See [Cloudflare Tunnels](#cloudflare-tunnels-per-user).
-3. **Your own domain / reverse proxy:** point `www.example.com` at `SERVER:80` and add the domain to the site (Edit → Advanced).
+3. **Your own domain / reverse proxy:** point `www.example.com` at `SERVER:38081` and add the domain to the site (Edit → Advanced).
 4. **Wildcard:** set **Settings → Sites base domain** to `sites.example.com`, point `*.sites.example.com` at the server, and every site appears at `<slug>.sites.example.com`.
 
 If you reach the sites through a reverse proxy, set **Settings → Sites URL** (e.g. `https://sites.example.com`) so the panel shows `https://sites.example.com/<slug>/`.
@@ -59,24 +59,18 @@ services:
     restart: unless-stopped
     environment:
       - TZ=America/New_York
-      - ADMIN_PORT=8080
-      - HOSTING_PORT=8081
-      - HOSTING_PUBLIC_PORT=80
+      - ADMIN_PORT=38080
+      - HOSTING_PORT=38081
     ports:
-      - "8080:8080"
-      - "80:8081"
+      - "38080:38080"
+      - "38081:38081"
     volumes:
       - /mnt/tank/apps/pagemaster:/data
 ```
 
-4. Open `http://TRUENAS-IP:8080` and sign in with `admin` / `admin`.
+4. Open `http://TRUENAS-IP:38080` and sign in with `admin` / `admin`.
 
-> **Port 80 on TrueNAS:** the TrueNAS web interface uses ports 80 and 443 by default, so the app won't start until you free them. Pick one:
-> - **Move the TrueNAS UI:** System → General Settings → GUI → Settings, set *Web Interface HTTP Port* to e.g. `81` and *HTTPS Port* to `444`, then save. Afterwards the NAS UI is at `http://TRUENAS-IP:81`.
-> - **Give Pagemaster its own IP:** add an alias IP on the NAS interface and publish `"192.168.1.60:80:8081"`.
-> - **Skip port 80** and only use Cloudflare Tunnels or a reverse proxy: publish e.g. `"8081:8081"` with `HOSTING_PUBLIC_PORT=8081`, or set **Settings → Sites URL** to your proxy address.
->
-> If 8080 is already taken, change **both** `ADMIN_PORT` and the mapping, e.g. `ADMIN_PORT=9080` with `"9080:9080"`.
+> Ports 38080/38081 don't clash with the TrueNAS UI or common apps. To use different ones, change **both** the env var and the mapping (e.g. `ADMIN_PORT=40080` with `"40080:40080"`). Tunnels follow `HOSTING_PORT` automatically.
 
 ### Proxmox VE
 
@@ -95,7 +89,7 @@ apt update && apt install -y curl && curl -fsSL https://get.docker.com | sh
 cd /opt/pagemaster && docker compose up -d
 ```
 
-4. Open `http://LXC-IP:8080`.
+4. Open `http://LXC-IP:38080`.
 
 **Option B: a VM.** Same steps as A, inside any Linux VM with Docker.
 
@@ -105,7 +99,7 @@ cd /opt/pagemaster && docker compose up -d
 
 ```bash
 docker run -d --name pagemaster --restart unless-stopped \
-  -p 8080:8080 -p 80:8081 \
+  -p 38080:38080 -p 38081:38081 \
   -v /srv/pagemaster:/data ghcr.io/nulljayden/pagemaster:latest
 ```
 
@@ -183,16 +177,16 @@ Removing a hostname or deleting the tunnel cleans up the DNS records and the tun
 
 1. In Zero Trust go to **Networks → Tunnels → Create a tunnel (Cloudflared)**, and copy the install command or token.
 2. In Pagemaster, go to **Tunnels → + Connect Cloudflare → Tunnel token** and paste it. Any of Cloudflare's install commands works.
-3. In the Cloudflare dashboard, add a public hostname with service **HTTP** → `localhost:8081`. Then in Pagemaster use **+ Publish a site** with the same hostname.
+3. In the Cloudflare dashboard, add a public hostname with service **HTTP** → `localhost:38081`. Then in Pagemaster use **+ Publish a site** with the same hostname.
 
-`cloudflared` runs inside the Pagemaster container, one process per tunnel. It restarts automatically and shows its status (connected, starting, error) and logs on the Tunnels page. Tunnels connect outbound only, so you don't need port 80, port-forwarding or a public IP.
+`cloudflared` runs inside the Pagemaster container, one process per tunnel. It restarts automatically and shows its status (connected, starting, error) and logs on the Tunnels page. Tunnels connect outbound only, so you don't need port-forwarding or a public IP, and the sites port never needs to be exposed outside your LAN.
 
 ## Reverse proxy / HTTPS
 
 Put Nginx Proxy Manager, Traefik, Caddy, etc. in front of it:
 
-- `pagemaster.example.com` → `SERVER:8080`. Set `TRUST_PROXY=true` and `COOKIE_SECURE=true`, and set **Public URL** in Settings. Enable WebSocket support so the terminal works.
-- `example.com`, `*.sites.example.com` → `SERVER:8081`.
+- `pagemaster.example.com` → `SERVER:38080`. Set `TRUST_PROXY=true` and `COOKIE_SECURE=true`, and set **Public URL** in Settings. Enable WebSocket support so the terminal works.
+- `example.com`, `*.sites.example.com` → `SERVER:38081`.
 
 ## Storage requirements (important on TrueNAS)
 
@@ -238,9 +232,9 @@ Snapshot that dataset or folder to back up. Deleting `pagemaster.json` resets th
 
 | Var | Default | |
 |---|---|---|
-| `ADMIN_PORT` | `8080` | Admin UI port |
-| `HOSTING_PORT` | `8081` | Shared hosting port |
-| `HOSTING_PUBLIC_PORT` | `80` (image) | Host port the sites are published on; used for the links shown in the UI |
+| `ADMIN_PORT` | `38080` | Admin UI port |
+| `HOSTING_PORT` | `38081` | Sites port (slug paths, domains, Cloudflare tunnels) |
+| `HOSTING_PUBLIC_PORT` | same as `HOSTING_PORT` | Only if the sites port is published on a different host port; used for links in the UI |
 | `CLOUDFLARED_BIN` | `cloudflared` | Path to cloudflared (bundled in the image) |
 | `SITE_PORT_RANGE` | `8100-8199` | Allowed dedicated site ports |
 | `APP_PORT_RANGE` | `20000-20999` | Internal app ports (not published) |

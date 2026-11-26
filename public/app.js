@@ -226,7 +226,6 @@
 
   async function pageSites(el) {
     const sys = state.system;
-    const portWarn = !sys.sitesUrl && !(sys.hostingPublicPort === 80 || sys.hostingPublicPort === 443);
     el.innerHTML = `
       <div class="page-head">
         <div><h1>Sites</h1><p>Git repositories deployed as websites. Each site lives at <code>${esc(sitesBase())}/&lt;slug&gt;/</code></p></div>
@@ -234,7 +233,6 @@
       </div>
       ${sys.storage && !sys.storage.ok ? `<div class="alert error"><b>Storage problem:</b> the /data volume can't run programs, so sites with install/build commands or App sites will fail (npm "Permission denied", exit code 126).<br>
         ${esc(sys.storage.problem)}<br><br>${esc(sys.storage.fix)}</div>` : ''}
-      ${portWarn ? `<div class="alert warn">Site links currently include port ${sys.hostingPublicPort}. To get plain <code>http://server/&lt;slug&gt;/</code> links, publish the hosting port on host port <b>80</b> and set <code>HOSTING_PUBLIC_PORT=80</code>${can('settings.manage') ? ', or set <b>Settings → Sites URL</b> to the address your reverse proxy uses' : ''}.</div>` : ''}
       <div id="site-list" class="sites"><div class="muted">Loading…</div></div>`;
     if ($('#add-site')) $('#add-site').onclick = () => siteForm();
     const load = async () => {
@@ -1028,7 +1026,7 @@
         <label class="field"><span>Public URL of this admin panel</span><input type="text" name="publicUrl" value="${esc(s.publicUrl)}" placeholder="https://pagemaster.example.com">
           <small>Used for SSO redirects and webhook URLs. Leave blank to use the address in your browser.</small></label>
         <label class="field"><span>Sites URL</span><input type="text" name="sitesUrl" value="${esc(s.sitesUrl)}" placeholder="e.g. http://192.168.1.50 or https://sites.example.com">
-          <small>The address people use to reach your sites. Each site is shown as <code>&lt;Sites URL&gt;/&lt;slug&gt;/</code>. Leave blank to use this server's address${state.system.hostingPublicPort === 80 ? '' : ` with port ${state.system.hostingPublicPort}`}.</small></label>
+          <small>The address people use to reach your sites. Each site is shown as <code>&lt;Sites URL&gt;/&lt;slug&gt;/</code>. Leave blank to use this server's address with port ${state.system.hostingPublicPort}. Sites published through a Cloudflare tunnel always use their tunnel hostname.</small></label>
         <label class="field"><span>Sites base domain</span><input type="text" name="sitesBaseDomain" value="${esc(s.sitesBaseDomain)}" placeholder="sites.example.com">
           <small>Optional. Every site is also served at <code>&lt;slug&gt;.&lt;base domain&gt;</code> on the shared hosting port (${state.system.hostingPort}) — point a wildcard DNS record / reverse proxy at it.</small></label>
       </div>
