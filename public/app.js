@@ -212,6 +212,8 @@
         <div><h1>Sites</h1><p>Git repositories deployed as websites.</p></div>
         ${can('sites.manage') ? '<button class="btn primary" id="add-site">+ Add site</button>' : ''}
       </div>
+      ${state.system.storage && !state.system.storage.ok ? `<div class="alert error"><b>Storage problem:</b> the /data volume can't run programs, so sites with install/build commands or App sites will fail (npm "Permission denied", exit code 126).<br>
+        ${esc(state.system.storage.problem)}<br><br>${esc(state.system.storage.fix)}</div>` : ''}
       <div id="site-list" class="sites"><div class="muted">Loading…</div></div>`;
     if ($('#add-site')) $('#add-site').onclick = () => siteForm();
     const load = async () => {

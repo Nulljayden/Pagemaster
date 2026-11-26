@@ -101,6 +101,7 @@ app.get('/api/system', auth.requireAuth, (_req, res) => {
     sitePortRange: config.SITE_PORT_RANGE,
     usedPorts: d.sites.filter((s) => s.port).map((s) => ({ port: s.port, site: s.name })),
     sitesBaseDomain: d.settings.sitesBaseDomain || '',
+    storage: { ...sites.getStorageCheck(), fix: sites.STORAGE_FIX },
     version: require('../package.json').version,
   });
 });

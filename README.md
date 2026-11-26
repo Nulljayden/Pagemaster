@@ -159,6 +159,34 @@ Put Nginx Proxy Manager, Traefik, Caddy, etc. in front of it:
 - `pagemaster.example.com` → `SERVER:8080`. Set `TRUST_PROXY=true` and `COOKIE_SECURE=true`, and set **Public URL** in Settings. Enable WebSocket support so the terminal works.
 - `example.com`, `*.sites.example.com` → `SERVER:8081`.
 
+## Storage requirements (important on TrueNAS)
+
+`npm ci`/builds and App sites need to **execute files** inside `/data/sites` (e.g. `node_modules/.bin/*`, native modules). That fails, with `npm error code 126` / `sh: cross-env: Permission denied`, when the storage behind `/data` has:
+
+- **Exec = Off** (mounted `noexec`), or
+- **ACL Mode = Restricted**, which is the TrueNAS **SMB** dataset preset. `chmod +x` is silently ignored there.
+
+Pagemaster checks this at startup and before each build, and shows a red banner on the Sites page if the storage can't run programs. Static sites without install/build commands still work.
+
+**Fix (pick one):**
+
+1. **Fix the dataset.** In TrueNAS go to Datasets → your dataset → Edit → Advanced Options, then set **Exec: On** and **ACL Mode: Passthrough** (or Discard). Or create a new dataset with the **Generic** or **Apps** preset instead of SMB. Redeploy the site afterwards. Delete the site's folder first so npm re-installs with the right permissions, or just delete and re-add the site.
+2. **Keep the dataset, put the sites on a Docker volume.** Docker named volumes always allow exec:
+
+```yaml
+    volumes:
+      - /mnt/tank/apps/pagemaster:/data
+      - pagemaster-sites:/data/sites   # sites + node_modules live here
+volumes:
+  pagemaster-sites:
+```
+
+Settings, users and tokens stay on your dataset. The cloned sites live in the volume, which you can rebuild from git anytime.
+
+### Apps that redirect to absolute paths
+
+Many apps redirect to `/login`, `/dashboard`, etc. Those break on the shared `/<slug>/` path. Give such sites a **dedicated port** (e.g. `8102`) or a **domain** instead.
+
 ## Data & backup
 
 Everything lives in `/data`:

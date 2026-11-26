@@ -22,3 +22,9 @@ services:
     volumes:
       # TrueNAS: change to a dataset path, e.g. /mnt/tank/apps/pagemaster:/data
       - ./data:/data
+      # If builds fail with "Permission denied" / code 126 (dataset with exec=off or
+      # ACL mode "Restricted"), keep sites on a Docker volume instead:
+      # - pagemaster-sites:/data/sites
+
+# volumes:
+#   pagemaster-sites:

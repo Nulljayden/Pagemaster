@@ -4,7 +4,7 @@ const path = require('path');
 const net = require('net');
 const http = require('http');
 const crypto = require('crypto');
-const { spawn } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 const express = require('express');
 const httpProxy = require('http-proxy');
 const config = require('./config');
@@ -231,11 +231,51 @@ function run(site, cmd, args, opts = {}) {
     p.on('error', (e) => { clearTimeout(timer); reject(e); });
     p.on('close', (code) => {
       clearTimeout(timer);
-      if (code === 0) resolve(out);
-      else reject(new Error(`${shown.split(' ').slice(0, 3).join(' ')} exited with code ${code}`));
+      if (code === 0) return resolve(out);
+      let msg = `${shown.split(' ').slice(0, 3).join(' ')} exited with code ${code}`;
+      // 126 = "found but not executable" (from the command itself or a script it ran)
+      if (code === 126 || /Permission denied/.test(out.slice(-2000))) {
+        const chk = checkStorage();
+        if (!chk.ok) msg += `\nStorage problem: ${chk.problem}\n${STORAGE_FIX}`;
+      }
+      reject(new Error(msg));
     });
   });
 }
+
+// ---------------------------------------------------------------- storage check
+// npm/yarn/build tools need to execute files inside the site folder. Some
+// storage can't: a dataset/mount with exec=off (noexec), or a ZFS dataset with
+// ACL mode "Restricted" (TrueNAS SMB preset) where chmod +x is silently ignored.
+let storageCheck = { ok: true, problem: '', checkedAt: 0 };
+
+function checkStorage() {
+  const f = path.join(config.SITES_DIR, `.pagemaster-exec-test-${process.pid}.sh`);
+  let problem = '';
+  try {
+    fs.writeFileSync(f, '#!/bin/sh\nexit 0\n');
+    try { fs.chmodSync(f, 0o755); } catch (_) {}
+    if ((fs.statSync(f).mode & 0o111) === 0) {
+      problem = 'chmod is being ignored (files cannot be marked executable). On TrueNAS this happens when the dataset ACL mode is "Restricted" (SMB share preset).';
+    } else {
+      try {
+        execFileSync(f, [], { timeout: 5000, stdio: 'ignore' });
+      } catch (e) {
+        problem = `programs cannot be run from this storage (${e.code || e.message}). The dataset or mount has exec disabled (noexec).`;
+      }
+    }
+  } catch (e) {
+    problem = `cannot write test file (${e.code || e.message}). Check the dataset permissions for the container user (root).`;
+  } finally {
+    try { fs.rmSync(f, { force: true }); } catch (_) {}
+  }
+  storageCheck = { ok: !problem, problem, checkedAt: Date.now() };
+  if (problem) console.warn(`[storage] ${config.SITES_DIR}: ${problem}`);
+  return storageCheck;
+}
+
+const STORAGE_FIX = 'Fix: on TrueNAS edit the dataset -> Advanced Options -> set Exec = On and ACL Mode = Passthrough/Discard (or use a "Generic"/"Apps" preset dataset). ' +
+  'Or mount a Docker named volume at /data/sites (see README "Storage requirements"). Static sites without install/build commands are not affected.';
 
 // ---------------------------------------------------------------- deploy
 function setStatus(site, status, extra = {}) {
@@ -260,7 +300,11 @@ async function deploy(siteId, opts = {}) {
     if (!changed && opts.onlyIfChanged) { setStatus(site, site.status, { lastCheck: Date.now() }); return; }
 
     setStatus(site, 'deploying');
-    const buildEnv = { ...process.env, ...parseEnv(site.env), CI: 'true' };
+    if (site.installCommand || site.buildCommand || site.mode === 'node') {
+      const chk = checkStorage();
+      if (!chk.ok) throw new Error(`Storage problem in ${config.SITES_DIR}: ${chk.problem}\n${STORAGE_FIX}`);
+    }
+    const buildEnv ={ ...process.env, ...parseEnv(site.env), CI: 'true' };
     if (site.installCommand) await run(site, 'sh', ['-c', site.installCommand], { cwd: dir, env: buildEnv, display: site.installCommand });
     if (site.buildCommand) await run(site, 'sh', ['-c', site.buildCommand], { cwd: dir, env: buildEnv, display: site.buildCommand });
 
@@ -303,8 +347,9 @@ async function syncRepo(site, dir, env, opts) {
   const remote = (await run(site, 'git', ['rev-parse', 'FETCH_HEAD'], { cwd: dir, env })).trim();
   if (opts.onlyIfChanged && remote === before) return false;
   if (opts.onlyIfChanged) log(site, `New commit detected (${remote.slice(0, 7)}), redeploying`);
+  // reset --hard updates tracked files (and removes ones deleted upstream).
+  // No `git clean`: untracked files (uploads, app data like SQLite DBs) are kept.
   await run(site, 'git', ['reset', '--hard', 'FETCH_HEAD'], { cwd: dir, env });
-  await run(site, 'git', ['clean', '-fd'], { cwd: dir, env });
   await submodules(site, dir, env);
   return remote !== before || !opts.onlyIfChanged;
 }
@@ -580,6 +625,7 @@ function info(site) {
 // ---------------------------------------------------------------- startup / scheduler
 async function startAll() {
   const d = db();
+  checkStorage();
   await syncDedicatedServers();
   for (const s of d.sites) {
     if (s.enabled === false) continue;
@@ -606,4 +652,5 @@ async function shutdown() {
 module.exports = {
   create, update, remove, deploy, setEnabled, info, readLog, startAll, shutdown,
   hostingHandler, hostingUpgrade, repoDir, slugify,
+  checkStorage, getStorageCheck: () => storageCheck, STORAGE_FIX,
 };
