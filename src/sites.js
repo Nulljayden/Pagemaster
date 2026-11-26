@@ -9,6 +9,7 @@ const express = require('express');
 const httpProxy = require('http-proxy');
 const config = require('./config');
 const { db, save, id, decrypt } = require('./db');
+const analytics = require('./analytics');
 
 const runtime = new Map(); // siteId -> { deploying, queued, proc, stopping, restarts, server, serverPort, handler, handlerDir }
 const proxy = httpProxy.createProxyServer({ xfwd: true, ws: true });
@@ -478,8 +479,31 @@ function isPreview(req) {
   } catch (_) { return false; }
 }
 
+function reqHostnames(req) {
+  return [req.headers['x-forwarded-host'], req.headers.host].filter(Boolean)
+    .map((h) => String(h).split(',')[0].trim().replace(/:\d+$/, '').toLowerCase());
+}
+
+// "Redirect other addresses to the primary one": only for page loads (GET/HEAD) that
+// arrive on a different hostname, never for the panel's own previews.
+function primaryRedirect(site, req) {
+  if (!site.redirectToPrimary || !site.primaryUrl || req._pmPreview) return null;
+  if (req.method !== 'GET' && req.method !== 'HEAD') return null;
+  let p;
+  try { p = new URL(site.primaryUrl); } catch (_) { return null; }
+  const hosts = reqHostnames(req);
+  if (!hosts.length || hosts.includes(p.hostname.toLowerCase())) return null;
+  return p.origin + p.pathname.replace(/\/+$/, '') + (req.url || '/');
+}
+
 function serveSite(site, req, res) {
   req._pmPreview = isPreview(req);
+  analytics.track(site, req, res);
+  const to = primaryRedirect(site, req);
+  if (to) {
+    res.writeHead(301, { Location: to, 'Cache-Control': 'no-store' });
+    return res.end();
+  }
   if (site.enabled === false) {
     res.writeHead(503, { 'Content-Type': 'text/plain' });
     return res.end('This site is currently stopped.');
@@ -663,11 +687,13 @@ async function syncDedicatedServers() {
 }
 
 // ---------------------------------------------------------------- CRUD
-async function create(input) {
+async function create(input, ownerId) {
   const data = await validate(input, null);
   const site = {
     id: id(),
     ...data,
+    ownerId: ownerId || null,
+    members: [],
     enabled: true,
     status: 'pending',
     webhookSecret: crypto.randomBytes(16).toString('hex'),
@@ -718,6 +744,25 @@ async function remove(siteId) {
   fs.rmSync(logFile(site), { force: true });
   fs.rmSync(logFile(site) + '.1', { force: true });
   runtime.delete(siteId);
+  analytics.removeSite(siteId);
+}
+
+// Primary address: one of the site's URLs, chosen in the panel. Doesn't redeploy.
+function setPrimary(siteId, input) {
+  const site = db().sites.find((s) => s.id === siteId);
+  if (!site) throw Object.assign(new Error('Site not found'), { status: 404 });
+  const url = String(input.primaryUrl || '').trim();
+  if (url) {
+    let u;
+    try { u = new URL(url); } catch (_) { u = null; }
+    if (!u || !/^https?:$/.test(u.protocol)) throw Object.assign(new Error('Primary address must be an http:// or https:// URL'), { status: 400 });
+    site.primaryUrl = u.origin + u.pathname.replace(/\/*$/, '/');
+  } else {
+    site.primaryUrl = '';
+  }
+  site.redirectToPrimary = !!(site.primaryUrl && input.redirectToPrimary);
+  save();
+  return site;
 }
 
 // Has this site had a successful install/build since its last change?
@@ -759,6 +804,7 @@ function info(site) {
   return {
     ...site,
     tunnelHosts,
+    stats7d: analytics.quick(site.id, 7),
     webhookSecret: undefined,
     running: site.mode === 'node' ? !!r.proc : undefined,
     deploying: !!r.deploying,
@@ -795,7 +841,7 @@ async function shutdown() {
 }
 
 module.exports = {
-  create, update, remove, deploy, setEnabled, info, readLog, startAll, shutdown,
+  create, update, remove, deploy, setEnabled, setPrimary, info, readLog, startAll, shutdown,
   hostingHandler, hostingUpgrade, repoDir, slugify,
   checkStorage, getStorageCheck: () => storageCheck, STORAGE_FIX,
 };

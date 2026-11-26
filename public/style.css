@@ -172,3 +172,31 @@ details.adv[open] summary { margin-bottom: 10px; }
   .main { padding: 16px; }
   .hide-sm { display: none; }
 }
+
+/* site settings hub */
+.settings-list { display: grid; gap: 8px; }
+.btn.settings-item { display: flex; flex-direction: column; align-items: flex-start; text-align: left; gap: 2px; padding: 10px 12px; height: auto; white-space: normal; }
+.btn.settings-item.danger b { color: var(--danger); }
+th.center, td.center { text-align: center; }
+
+/* analytics */
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin: 14px 0; }
+.stat { background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; }
+.stat-label { font-size: 12px; color: var(--muted); }
+.stat-value { font-size: 22px; font-weight: 600; line-height: 1.3; font-variant-numeric: tabular-nums; }
+.stat-note { font-size: 11.5px; color: var(--muted); }
+.chart { position: relative; margin: 10px 0 6px; min-height: 210px; }
+.chart svg { display: block; max-width: 100%; }
+.ch-grid { stroke: var(--border); stroke-width: 1; }
+.ch-axis { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.ch-bar { fill: var(--accent); }
+.ch-hit { fill: transparent; cursor: default; }
+.ch-hit.on { fill: var(--text); fill-opacity: .06; }
+.ch-tip { position: absolute; top: 0; width: 170px; pointer-events: none; background: var(--panel); border: 1px solid var(--border); box-shadow: var(--shadow); border-radius: 8px; padding: 6px 10px; font-size: 12px; line-height: 1.45; font-variant-numeric: tabular-nums; }
+.an-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+.an-grid .card { margin: 0; }
+.an-top table td { padding: 3px 6px; border: 0; }
+.an-key { position: relative; max-width: 0; width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.an-key span { position: relative; }
+.an-fill { position: absolute; left: 0; top: 2px; bottom: 2px; background: var(--accent); opacity: .14; border-radius: 4px; }
+.an-num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }

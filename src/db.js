@@ -86,6 +86,14 @@ function load() {
   state.settings = Object.assign({}, DEFAULT_SETTINGS, state.settings || {});
   state.settings.sso = Object.assign({}, DEFAULT_SETTINGS.sso, state.settings.sso || {});
 
+  // Every site has an owner. Sites from before ownership existed (or whose owner
+  // was removed) belong to the first admin.
+  const firstAdmin = state.users.find((u) => u.isAdmin && !u.disabled) || state.users.find((u) => u.isAdmin);
+  for (const s of state.sites) {
+    if (!Array.isArray(s.members)) s.members = [];
+    if ((!s.ownerId || !state.users.some((u) => u.id === s.ownerId)) && firstAdmin) s.ownerId = firstAdmin.id;
+  }
+
   // Drop expired sessions on start
   const now = Date.now();
   state.sessions = state.sessions.filter((s) => s.expires > now);

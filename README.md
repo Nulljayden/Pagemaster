@@ -9,6 +9,9 @@ A self-hosted control panel for hosting websites straight from git repositories.
 - **File browser** to browse, edit, upload, download, rename and delete files.
 - **Built-in terminal**, a full shell inside the container in your browser.
 - **User management** with fine-grained permissions. The default login is **`admin` / `admin`**, and you get a prompt to change it on first sign-in.
+- **Site ownership & sharing.** Every site has an owner who can share it with individual users (view, deploy, manage, files) or transfer it to someone else.
+- **Built-in analytics** per site: visitors, page views, top pages, referrers, countries, status codes and bandwidth. No cookies or tracking script.
+- **Primary address.** When a site has several URLs, pick the main one and optionally redirect the others to it.
 - **SSO (OpenID Connect)** for Authentik, Authelia, Keycloak, Zitadel, Pocket ID, Google, Entra ID and others. Local login stays available. New SSO users get the **lowest access** (`sites.view` only) until an admin raises it.
 - **Slug URLs, no ports.** Every site lives at `http://server/<slug>/`. Apps that redirect to `/login` or link to `/assets/...` still work under the slug: redirects and cookies are rewritten, and absolute links get routed back into the right site.
 - **Live site previews.** Each site card shows a thumbnail, and the preview window has desktop, tablet and phone sizes.
@@ -158,10 +161,39 @@ Admins have everything. At least one active admin always has to exist.
 
 ## SSO setup (OIDC)
 
-1. In your identity provider, create an OIDC / OAuth2 application with a confidential client and the *authorization code* flow.
-2. Set the redirect URI to `https://YOUR-PAGEMASTER/auth/sso/callback`. The exact value is shown in **Settings**, so set **Public URL** first if you use a reverse proxy.
+1. In Pagemaster **Settings**, set **Public URL** to the address you open the panel on, e.g. `https://pagemaster.example.com`, and save. If you skip this behind a reverse proxy or Cloudflare, the redirect URI comes out as `http://...` and the provider rejects the login.
+2. In your identity provider, create an OIDC / OAuth2 application with a confidential client and the *authorization code* flow. Use the **Redirect URI** shown in Settings.
 3. In Pagemaster **Settings**, enter the issuer URL, client ID and secret, then tick **Enable SSO login**.
-4. New SSO users only get the permissions ticked under *Default permissions*. Raise their access in **Users**.
+4. New SSO users only get the permissions ticked under *Default permissions*. Raise their access in **Users**, or share single sites with them.
+
+### Authentik
+
+1. **Applications → Providers → Create → OAuth2/OpenID Provider.**
+   - Authorization flow: `default-provider-authorization-implicit-consent` (or explicit, if you want a consent screen).
+   - Client type: **Confidential**.
+   - Redirect URIs: **Strict**, and paste the Redirect URI from Pagemaster Settings (`https://pagemaster.example.com/auth/sso/callback`).
+   - Scopes: keep `openid`, `email`, `profile`.
+   - Subject mode: *Based on the User's hashed ID* (the default) is fine.
+2. **Applications → Applications → Create**: name `Pagemaster`, slug `pagemaster`, provider = the one above. Bind users or groups under *Policy / Group / User Bindings* to choose who may sign in.
+3. In Pagemaster Settings:
+   - Issuer URL: `https://auth.example.com/application/o/pagemaster/` (Authentik shows it on the provider page as *OpenID Configuration Issuer*).
+   - Client ID and Client Secret: copy them from the provider.
+   - Tick **Enable SSO login** and save.
+
+### Linking SSO to an existing account
+
+Signing in with SSO for the first time creates a new user. To use SSO with the account you already have (e.g. `admin`) instead:
+
+- **Yourself:** sign in with your password, go to **My Account → Single sign-on → Link SSO account**, and log in at your provider. From then on, *Sign in with SSO* opens that account. Your password keeps working, and you can unlink at any time.
+- **As an admin:** if SSO already created a duplicate user, open the original user in **Users → Edit**, pick the duplicate under *Link an SSO user into this account* and save. The SSO login, sites, shares and tunnels move over and the duplicate is deleted.
+
+## Site ownership, sharing and analytics
+
+- The user who adds a site **owns** it. Sites that existed before this feature belong to the first admin.
+- **⚙ Settings → Sharing** gives other users access to just that site: `view` (status, logs, analytics), `deploy`, `manage` (edit, addresses, webhook), `files.read` and `files.write`. Global permissions in **Users** still apply to every site. Note that `manage` lets someone change build/start commands, which run inside the container.
+- **⚙ Settings → Transfer ownership** hands a site to another user (owner or admin only), optionally keeping your access. Tunnels have a **Transfer** button too. Deleting a user moves their sites to the admin who deleted them.
+- **⚙ Settings → Primary address** picks which URL is shown first. Optionally all other hostnames get a 301 redirect to it.
+- **📊 Analytics** shows visitors, page views, requests, bandwidth, error rate, top pages, referrers, countries (via Cloudflare) and which address people used. It is counted from the requests Pagemaster serves, with no cookies and no script added to your site. Data is kept for 400 days in `/data/analytics.json`.
 
 ## Cloudflare Tunnels (per user)
 

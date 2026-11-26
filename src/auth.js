@@ -38,6 +38,9 @@ function publicUser(u) {
     disabled: !!u.disabled,
     createdAt: u.createdAt,
     lastLogin: u.lastLogin || null,
+    hasPassword: !!u.passwordHash,
+    ssoLinked: !!u.ssoSubject,
+    ssoName: u.ssoSubject ? (u.ssoName || '') : '',
   };
 }
 

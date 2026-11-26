@@ -5,7 +5,7 @@
   const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const app = $('#app');
 
-  const state = { user: null, permissions: {}, system: null, page: 'sites', timer: null, term: null, filesPath: '/' };
+  const state = { user: null, permissions: {}, sitePermissions: {}, siteAccess: {}, ssoEnabled: false, system: null, page: 'sites', timer: null, term: null, filesPath: '/', directory: null };
 
   // ------------------------------------------------------------------ helpers
   async function api(method, url, body, opts = {}) {
@@ -29,6 +29,17 @@
   }
 
   function can(p) { return state.user && (state.user.isAdmin || state.user.permissions.includes(p)); }
+  function pageVisible(p) { return !p.perm || can(p.perm) || !!(p.alt && p.alt()); }
+  async function directory() {
+    if (!state.directory) state.directory = await api('GET', '/api/users/directory');
+    return state.directory;
+  }
+  function fmtNum(n) {
+    n = n || 0;
+    if (n < 10000) return n.toLocaleString();
+    if (n < 1e6) return (n / 1000).toFixed(n < 1e5 ? 1 : 0).replace(/\.0$/, '') + 'K';
+    return (n / 1e6).toFixed(1).replace(/\.0$/, '') + 'M';
+  }
 
   function modal(html, { wide = false, onMount } = {}) {
     const root = $('#modal-root');
@@ -112,8 +123,8 @@
 
   // ------------------------------------------------------------------ shell
   const PAGES = [
-    { id: 'sites', label: 'Sites', icon: '🌐', perm: 'sites.view' },
-    { id: 'files', label: 'Files', icon: '📁', perm: 'files.read' },
+    { id: 'sites', label: 'Sites', icon: '🌐', perm: 'sites.view', alt: () => state.siteAccess.view || can('sites.manage') },
+    { id: 'files', label: 'Files', icon: '📁', perm: 'files.read', alt: () => state.siteAccess.files },
     { id: 'terminal', label: 'Terminal', icon: '⌨️', perm: 'terminal' },
     { id: 'tunnels', label: 'Tunnels', icon: '☁️', perm: 'tunnels.manage' },
     { id: 'credentials', label: 'Git Credentials', icon: '🔑', perm: 'credentials.manage' },
@@ -127,13 +138,21 @@
       const me = await api('GET', '/api/me', undefined, { allow401: true });
       state.user = me.user;
       state.permissions = me.permissions;
+      state.sitePermissions = me.sitePermissions || {};
+      state.siteAccess = me.siteAccess || {};
+      state.ssoEnabled = !!me.ssoEnabled;
+      state.directory = null;
       state.system = await api('GET', '/api/system');
     } catch (_) {
       return renderLogin();
     }
     renderShell();
+    const qs = new URLSearchParams(location.search);
+    if (qs.get('error')) toast(qs.get('error'), 'error');
+    if (qs.get('notice')) toast(qs.get('notice'), 'ok');
+    if (qs.has('error') || qs.has('notice')) history.replaceState(null, '', '/' + location.hash);
     const fromHash = location.hash.slice(1);
-    const allowed = PAGES.filter((p) => !p.perm || can(p.perm));
+    const allowed = PAGES.filter(pageVisible);
     go(allowed.some((p) => p.id === fromHash) ? fromHash : allowed[0].id);
     if (state.user.mustChangePassword && !sessionStorage.getItem('pm-skip-pw')) passwordPrompt();
   }
@@ -144,7 +163,7 @@
       <div class="layout">
         <aside class="sidebar">
           <div class="brand"><div class="brand-logo">P</div>Pagemaster</div>
-          <nav class="nav">${PAGES.filter((p) => !p.perm || can(p.perm)).map((p) =>
+          <nav class="nav">${PAGES.filter(pageVisible).map((p) =>
             `<a href="#${p.id}" data-page="${p.id}"><span>${p.icon}</span><span>${p.label}</span></a>`).join('')}</nav>
           <div class="spacer"></div>
           <div class="userbox">
@@ -217,6 +236,12 @@
     if (state.system.sitesBaseDomain) urls.push({ label: 'Subdomain', url: `http://${s.slug}.${state.system.sitesBaseDomain}/` });
     urls.push({ label: 'Slug', url: `${sitesBase()}/${s.slug}/` });
     if (s.port) urls.push({ label: 'Dedicated port', url: `${location.protocol}//${location.hostname}:${s.port}/` });
+    if (s.primaryUrl) {
+      const norm = (u) => u.replace(/\/+$/, '').toLowerCase();
+      const i = urls.findIndex((u) => norm(u.url) === norm(s.primaryUrl));
+      const p = i >= 0 ? urls.splice(i, 1)[0] : { label: 'Custom address', url: s.primaryUrl };
+      urls.unshift({ ...p, primary: true });
+    }
     return urls;
   }
 
@@ -248,28 +273,34 @@
     const status = s.deploying ? 'deploying' : (s.status || 'pending');
     const urls = siteUrls(s);
     const short = (u) => u.replace(/^https?:\/\//, '').replace(/\/$/, '');
+    const my = s.my || {};
+    const st = s.stats7d || {};
     return `
         <div class="site-head">
           <h3>${esc(s.name)}</h3>
           <span class="badge ${esc(status)}">${esc(status)}</span>
           <span class="tag">${s.mode === 'node' ? 'App' : 'Static'}</span>
           ${s.autoPullMinutes ? `<span class="tag">auto-pull ${s.autoPullMinutes}m</span>` : ''}
+          ${my.owner ? '' : `<span class="tag" title="Owner">👤 ${esc(s.ownerName)}</span>`}
+          ${(s.members || []).length ? `<span class="tag" title="Shared with ${esc(s.members.map((m) => m.username).join(', '))}">shared · ${s.members.length}</span>` : ''}
         </div>
         <div class="site-meta">
-          <div><span class="k">Address</span><a href="${esc(urls[0].url)}" target="_blank" rel="noopener" class="site-main-url">${esc(short(urls[0].url))}</a></div>
+          <div><span class="k">Address</span><a href="${esc(urls[0].url)}" target="_blank" rel="noopener" class="site-main-url">${esc(short(urls[0].url))}</a>${urls[0].primary ? ' <span class="tag" title="Primary address">primary</span>' : ''}${s.redirectToPrimary ? ' <span class="tag" title="Other addresses redirect here">redirects</span>' : ''}</div>
           ${urls.length > 1 ? `<div><span class="k">Also at</span>${urls.slice(1).map((u) => `<a class="tag" href="${esc(u.url)}" target="_blank" rel="noopener" title="${esc(u.label)}">${esc(short(u.url))}</a>`).join('')}</div>` : ''}
           <div><span class="k">Repo</span><span class="mono">${esc(s.repoUrl)}</span>${s.branch ? ` <span class="tag">${esc(s.branch)}</span>` : ''}</div>
           <div><span class="k">Commit</span>${esc(s.lastCommit || '—')} <span class="muted small">· ${fmtTime(s.lastDeploy)}</span></div>
+          <div><span class="k">Last 7 days</span><a href="#" data-act="analytics">${fmtNum(st.visitors)} visitors · ${fmtNum(st.pageviews)} page views</a></div>
           ${s.lastError ? `<div class="err small">${esc(s.lastError)}</div>` : ''}
         </div>
         <div class="row site-actions">
           <button class="btn sm" data-act="preview">👁 Preview</button>
-          ${can('tunnels.manage') ? '<button class="btn sm" data-act="publish">☁ Publish</button>' : ''}
-          ${can('sites.deploy') ? `<button class="btn sm" data-act="deploy">⟳ Pull &amp; deploy</button>
+          <button class="btn sm" data-act="analytics">📊 Analytics</button>
+          ${can('tunnels.manage') && my.manage ? '<button class="btn sm" data-act="publish">☁ Publish</button>' : ''}
+          ${my.deploy ? `<button class="btn sm" data-act="deploy">⟳ Pull &amp; deploy</button>
             ${s.enabled === false ? '<button class="btn sm" data-act="start">▶ Start</button>' : '<button class="btn sm" data-act="stop">■ Stop</button>'}` : ''}
           <button class="btn sm" data-act="log">Logs</button>
-          ${can('files.read') ? '<button class="btn sm" data-act="files">Files</button>' : ''}
-          ${can('sites.manage') ? '<button class="btn sm" data-act="webhook">Webhook</button><button class="btn sm" data-act="edit">Edit</button><button class="btn sm danger" data-act="delete">Delete</button>' : ''}
+          ${my['files.read'] ? '<button class="btn sm" data-act="files">Files</button>' : ''}
+          ${my.manage || my.share || my.transfer ? '<button class="btn sm" data-act="settings">⚙ Settings</button>' : ''}
         </div>`;
   }
 
@@ -288,7 +319,7 @@
     if (!box) return;
     box._sites = list;
     if (!list.length) {
-      box.innerHTML = `<div class="card empty">No sites yet.${can('sites.manage') ? ' Click <b>+ Add site</b> to deploy a repository.' : ''}</div>`;
+      box.innerHTML = `<div class="card empty">${can('sites.manage') ? 'No sites yet. Click <b>+ Add site</b> to deploy a repository.' : 'No sites have been shared with you yet.'}</div>`;
       return;
     }
     if (!box.querySelector('.site')) box.innerHTML = '';
@@ -311,7 +342,7 @@
       }
       $('.site-info', card).innerHTML = siteInfoHtml(s);
       $$('[data-act]', card).forEach((b) => {
-        b.onclick = () => siteAction(b.dataset.act, box._sites.find((x) => x.id === s.id));
+        b.onclick = (e) => { e.preventDefault(); siteAction(b.dataset.act, box._sites.find((x) => x.id === s.id)); };
       });
     });
     $$('.site', box).forEach((c) => { if (!seen.has(c.dataset.id)) box.removeChild(c); });
@@ -358,6 +389,11 @@
       if (act === 'publish') { publishSite(s); return; }
       if (act === 'files') { state.filesPath = '/' + s.slug; go('files'); return; }
       if (act === 'webhook') showWebhook(s);
+      if (act === 'analytics') { showAnalytics(s); return; }
+      if (act === 'settings') { siteSettings(s); return; }
+      if (act === 'addresses') { addressesForm(s); return; }
+      if (act === 'share') { shareForm(s); return; }
+      if (act === 'transfer') { transferForm(s); return; }
       if (act === 'delete') {
         if (!(await confirmBox(`Delete "${s.name}" and its cloned files? This cannot be undone.`))) return;
         await api('DELETE', `/api/sites/${s.id}`);
@@ -399,6 +435,257 @@
         };
       },
     });
+  }
+
+  async function refreshSites() {
+    if (state.page === 'sites') renderSiteList(await api('GET', '/api/sites'));
+  }
+
+  // One place for everything that changes a site's setup
+  function siteSettings(s) {
+    const my = s.my || {};
+    const item = (act, title, text, cls = '') => `<button class="btn block settings-item ${cls}" data-go="${act}"><b>${title}</b><span class="muted small">${text}</span></button>`;
+    modal(`<h2>${esc(s.name)}: settings</h2>
+      <p class="muted small" style="margin-top:0">Owner: <b>${esc(s.ownerName)}</b>${my.owner ? ' (you)' : ''}</p>
+      <div class="settings-list">
+        ${my.manage ? item('edit', 'Edit site', 'Repository, build and start commands, custom domains, port. Saving redeploys.') : ''}
+        ${my.manage ? item('addresses', 'Primary address', 'Choose which URL is the main one, and optionally redirect the others to it.') : ''}
+        ${my.manage ? item('webhook', 'Deploy webhook', 'URL your git host calls on every push.') : ''}
+        ${my.share ? item('share', 'Sharing', 'Give other users access to just this site.') : ''}
+        ${my.transfer ? item('transfer', 'Transfer ownership', 'Hand the site to another user.') : ''}
+        ${my.share ? item('delete', 'Delete site', 'Removes the site, its files and analytics.', 'danger') : ''}
+      </div>
+      <div class="modal-foot"><button class="btn" data-close>Close</button></div>`, {
+      onMount: (m, close) => {
+        $$('[data-go]', m).forEach((b) => { b.onclick = () => { close(); siteAction(b.dataset.go, s); }; });
+      },
+    });
+  }
+
+  function addressesForm(s) {
+    const urls = siteUrls({ ...s, primaryUrl: '' });
+    const norm = (u) => (u || '').replace(/\/+$/, '').toLowerCase();
+    const cur = norm(s.primaryUrl);
+    const known = urls.some((u) => norm(u.url) === cur);
+    modal(`<h2>Primary address: ${esc(s.name)}</h2>
+      <p class="muted">The primary address is shown first everywhere in Pagemaster. Pick one of the site's addresses, or type another one (e.g. a reverse proxy URL).</p>
+      <form id="addr-form">
+        <label class="check"><input type="radio" name="pick" value="" ${!cur ? 'checked' : ''}> <span>Automatic <span class="muted small">(best available: tunnel, then domain, then slug)</span></span></label>
+        ${urls.map((u) => `<label class="check"><input type="radio" name="pick" value="${esc(u.url)}" ${cur && norm(u.url) === cur ? 'checked' : ''}> <span><span class="mono">${esc(u.url)}</span> <span class="muted small">· ${esc(u.label)}</span></span></label>`).join('')}
+        <label class="check"><input type="radio" name="pick" value="__custom" ${cur && !known ? 'checked' : ''}> <span>Other address</span></label>
+        <input type="text" id="addr-custom" placeholder="https://www.example.com/" value="${cur && !known ? esc(s.primaryUrl) : ''}" style="margin:4px 0 12px">
+        <label class="check"><input type="checkbox" name="redirectToPrimary" ${s.redirectToPrimary ? 'checked' : ''}> <span><b>Redirect the other addresses to the primary one</b> (301)</span></label>
+        <div class="alert warn small">Only turn this on once the primary address works. Visitors on any other hostname are sent there, so a primary address that only works on your LAN would lock out visitors coming through a tunnel. Pagemaster's own previews are never redirected.</div>
+        <div class="modal-foot"><button type="button" class="btn" data-close>Cancel</button><button class="btn primary">Save</button></div>
+      </form>`, {
+      onMount: (m, close) => {
+        $('#addr-custom', m).oninput = () => { $('[value="__custom"]', m).checked = true; };
+        $('#addr-form', m).onsubmit = async (e) => {
+          e.preventDefault();
+          const pick = $('[name=pick]:checked', m).value;
+          const primaryUrl = pick === '__custom' ? $('#addr-custom', m).value.trim() : pick;
+          try {
+            await api('PUT', `/api/sites/${s.id}/primary`, { primaryUrl, redirectToPrimary: $('[name=redirectToPrimary]', m).checked });
+            toast('Primary address saved', 'ok');
+            close();
+            refreshSites();
+          } catch (ex) { toast(ex.message, 'error'); }
+        };
+      },
+    });
+  }
+
+  async function shareForm(s) {
+    let users;
+    try { users = await directory(); } catch (e) { return toast(e.message, 'error'); }
+    const perms = state.sitePermissions;
+    let members = (s.members || []).map((m) => ({ ...m, perms: [...m.perms] }));
+    modal(`<h2>Share "${esc(s.name)}"</h2>
+      <p class="muted">These users get access to <b>this site only</b>, on top of their global permissions. The owner (<b>${esc(s.ownerName)}</b>) and admins always have full access.</p>
+      <div id="mem-list"></div>
+      <div class="row" style="margin-top:12px"><select id="mem-add" class="grow" style="width:auto"></select><button type="button" class="btn" id="mem-add-btn">+ Add user</button></div>
+      <p class="muted small">${Object.entries(perms).map(([k, d]) => `<code>${esc(k)}</code>: ${esc(d)}`).join('<br>')}</p>
+      <div class="modal-foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="mem-save">Save</button></div>`, {
+      wide: true,
+      onMount: (m, close) => {
+        const draw = () => {
+          $('#mem-list', m).innerHTML = members.length ? `<table><thead><tr><th>User</th>${Object.keys(perms).map((k) => `<th class="center">${esc(k)}</th>`).join('')}<th></th></tr></thead><tbody>
+            ${members.map((mm, i) => `<tr data-i="${i}"><td><b>${esc(mm.username)}</b></td>
+              ${Object.keys(perms).map((k) => `<td class="center"><input type="checkbox" data-p="${esc(k)}" ${mm.perms.includes(k) ? 'checked' : ''} aria-label="${esc(k)}"></td>`).join('')}
+              <td style="text-align:right"><button type="button" class="btn sm danger" data-rm>Remove</button></td></tr>`).join('')}
+            </tbody></table>` : '<div class="empty">Not shared with anyone.</div>';
+          $$('#mem-list tr[data-i]', m).forEach((tr) => {
+            const mm = members[+tr.dataset.i];
+            $$('[data-p]', tr).forEach((c) => { c.onchange = () => { mm.perms = $$('[data-p]', tr).filter((x) => x.checked).map((x) => x.dataset.p); }; });
+            $('[data-rm]', tr).onclick = () => { members.splice(+tr.dataset.i, 1); draw(); };
+          });
+          const avail = users.filter((u) => u.id !== s.ownerId && !members.some((mm) => mm.userId === u.id));
+          $('#mem-add', m).innerHTML = avail.length ? avail.map((u) => `<option value="${esc(u.id)}">${esc(u.username)}${u.displayName ? ' (' + esc(u.displayName) + ')' : ''}</option>`).join('') : '<option value="">No more users</option>';
+        };
+        $('#mem-add-btn', m).onclick = () => {
+          const u = users.find((x) => x.id === $('#mem-add', m).value);
+          if (!u) return;
+          members.push({ userId: u.id, username: u.username, perms: ['view'] });
+          draw();
+        };
+        $('#mem-save', m).onclick = async () => {
+          try {
+            await api('PUT', `/api/sites/${s.id}/members`, { members: members.map((mm) => ({ userId: mm.userId, perms: mm.perms })) });
+            toast('Sharing saved', 'ok');
+            close();
+            refreshSites();
+          } catch (ex) { toast(ex.message, 'error'); }
+        };
+        draw();
+      },
+    });
+  }
+
+  async function transferForm(s) {
+    let users;
+    try { users = (await directory()).filter((u) => u.id !== s.ownerId); } catch (e) { return toast(e.message, 'error'); }
+    if (!users.length) return toast('There is no other user to transfer to', 'error');
+    const mine = s.my && s.my.owner;
+    modal(`<h2>Transfer "${esc(s.name)}"</h2>
+      <p>The new owner gets full control of the site, including sharing, transferring and deleting it.</p>
+      <form id="xfer-form">
+        <label class="field"><span>New owner</span><select name="userId">${users.map((u) => `<option value="${esc(u.id)}">${esc(u.username)}${u.displayName ? ' (' + esc(u.displayName) + ')' : ''}</option>`).join('')}</select></label>
+        <label class="check"><input type="checkbox" name="keepAccess" ${mine ? 'checked' : ''}> <span>Keep ${mine ? 'my' : `<b>${esc(s.ownerName)}</b>'s`} access to the site (as a member with every site permission)</span></label>
+        <div class="modal-foot"><button type="button" class="btn" data-close>Cancel</button><button class="btn danger solid">Transfer</button></div>
+      </form>`, {
+      onMount: (m, close) => {
+        $('#xfer-form', m).onsubmit = async (e) => {
+          e.preventDefault();
+          try {
+            await api('POST', `/api/sites/${s.id}/transfer`, formData(e.target));
+            toast('Ownership transferred', 'ok');
+            close();
+            refreshSites();
+          } catch (ex) { toast(ex.message, 'error'); }
+        };
+      },
+    });
+  }
+
+  // ------------------------------------------------------------------ analytics
+  const flag = (cc) => /^[A-Z]{2}$/.test(cc) ? String.fromCodePoint(...[...cc].map((c) => 127397 + c.charCodeAt(0))) : '';
+  function niceMax(v) {
+    if (v <= 4) return 4;
+    const p = 10 ** Math.floor(Math.log10(v));
+    for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= v) return m * p;
+    return 10 * p;
+  }
+  const fmtDay = (d, long) => new Date(d + 'T12:00:00').toLocaleDateString(undefined, long ? { weekday: 'short', month: 'short', day: 'numeric' } : { month: 'short', day: 'numeric' });
+
+  // Single-series column chart with hover tooltip, drawn as inline SVG
+  function columnChart(box, series, key, label) {
+    const W = Math.max(280, box.getBoundingClientRect().width - 1);
+    const H = 210;
+    const padL = 44;
+    const padB = 24;
+    const padT = 10;
+    const plotH = H - padT - padB;
+    const max = niceMax(Math.max(0, ...series.map((d) => d[key])));
+    const n = series.length;
+    const slot = (W - padL) / n;
+    const bw = Math.max(2, Math.min(24, slot - 2));
+    const y = (v) => padT + plotH - (v / max) * plotH;
+    const ticks = [0, max / 2, max];
+    const every = Math.ceil(n / Math.max(2, Math.floor((W - padL) / 70)));
+    let svg = `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="${esc(label)} per day">`;
+    for (const t of ticks) {
+      svg += `<line x1="${padL}" x2="${W}" y1="${y(t)}" y2="${y(t)}" class="ch-grid"/><text x="${padL - 6}" y="${y(t) + 4}" text-anchor="end" class="ch-axis">${fmtNum(t)}</text>`;
+    }
+    series.forEach((d, i) => {
+      const x = padL + i * slot + (slot - bw) / 2;
+      const h = (d[key] / max) * plotH;
+      if (h > 0) {
+        const r = Math.min(4, bw / 2, h);
+        const top = padT + plotH - h;
+        svg += `<path class="ch-bar" d="M${x},${padT + plotH}V${top + r}Q${x},${top} ${x + r},${top}H${x + bw - r}Q${x + bw},${top} ${x + bw},${top + r}V${padT + plotH}Z"/>`;
+      }
+      if (i % every === 0 || i === n - 1 && n <= 14) svg += `<text x="${padL + i * slot + slot / 2}" y="${H - 6}" text-anchor="middle" class="ch-axis">${esc(fmtDay(d.date))}</text>`;
+      svg += `<rect class="ch-hit" data-i="${i}" x="${padL + i * slot}" y="${padT}" width="${slot}" height="${plotH}"/>`;
+    });
+    svg += '</svg><div class="ch-tip" hidden></div>';
+    box.innerHTML = svg;
+    const tip = $('.ch-tip', box);
+    $$('.ch-hit', box).forEach((r) => {
+      r.onmouseenter = () => {
+        const d = series[+r.dataset.i];
+        $$('.ch-hit', box).forEach((x) => x.classList.toggle('on', x === r));
+        tip.innerHTML = `<b>${esc(fmtDay(d.date, true))}</b><br>${fmtNum(d.uv)} visitors<br>${fmtNum(d.pv)} page views<br>${fmtNum(d.req)} requests · ${fmtSize(d.bytes)}`;
+        tip.hidden = false;
+        const cx = +r.getAttribute('x') + slot / 2;
+        tip.style.left = Math.min(Math.max(0, cx - 80), W - 170) + 'px';
+      };
+    });
+    box.onmouseleave = () => { tip.hidden = true; $$('.ch-hit', box).forEach((x) => x.classList.remove('on')); };
+  }
+
+  function topTable(title, rows, total, fmtKey = esc) {
+    return `<div class="card an-top"><h3>${title}</h3>${rows.length ? `<table><tbody>${rows.map((r) => `<tr>
+      <td class="an-key"><div class="an-fill" style="width:${total ? Math.max(1, Math.round(r.count / rows[0].count * 100)) : 0}%"></div><span>${fmtKey(r.key)}</span></td>
+      <td class="an-num">${fmtNum(r.count)}</td></tr>`).join('')}</tbody></table>` : '<div class="muted small">No data yet</div>'}</div>`;
+  }
+
+  function showAnalytics(s) {
+    let days = 30;
+    let metric = 'uv';
+    let data = null;
+    const m = modal(`<div class="row preview-bar">
+        <h2 class="grow" style="margin:0">Analytics: ${esc(s.name)}</h2>
+        <div class="seg" id="an-days">${[7, 30, 90].map((d) => `<button class="btn sm ${d === days ? 'on' : ''}" data-d="${d}">${d} days</button>`).join('')}</div>
+        <button class="btn sm" data-close>Close</button>
+      </div>
+      <div id="an-body"><div class="muted" style="padding:20px">Loading…</div></div>`, { wide: true });
+    const el = m.el;
+    const render = () => {
+      const t = data.totals;
+      const errs = t.status['4xx'] + t.status['5xx'];
+      const tile = (label, value, note = '') => `<div class="stat"><div class="stat-label">${label}</div><div class="stat-value">${value}</div>${note ? `<div class="stat-note">${note}</div>` : ''}</div>`;
+      $('#an-body', el).innerHTML = `
+        <div class="stats">
+          ${tile('Visitors', fmtNum(t.visitors), 'unique per day')}
+          ${tile('Page views', fmtNum(t.pageviews))}
+          ${tile('Requests', fmtNum(t.requests), 'pages, assets, API')}
+          ${tile('Bandwidth', fmtSize(t.bytes))}
+          ${tile('Errors', t.requests ? ((errs / t.requests) * 100).toFixed(1) + '%' : '0%', `${fmtNum(t.status['4xx'])} 4xx · ${fmtNum(t.status['5xx'])} 5xx`)}
+          ${tile('Bots', fmtNum(t.bots), 'not counted as visitors')}
+        </div>
+        <div class="card">
+          <div class="row"><h3 class="grow" style="margin:0">${metric === 'uv' ? 'Visitors' : 'Page views'} per day</h3>
+            <div class="seg" id="an-metric"><button class="btn sm ${metric === 'uv' ? 'on' : ''}" data-m="uv">Visitors</button><button class="btn sm ${metric === 'pv' ? 'on' : ''}" data-m="pv">Page views</button></div></div>
+          <div class="chart" id="an-chart"></div>
+          <details class="small"><summary>Show as table</summary>
+            <table><thead><tr><th>Day</th><th class="an-num">Visitors</th><th class="an-num">Page views</th><th class="an-num">Requests</th><th class="an-num">Bandwidth</th></tr></thead><tbody>
+            ${data.series.slice().reverse().map((d) => `<tr><td>${esc(fmtDay(d.date, true))}</td><td class="an-num">${fmtNum(d.uv)}</td><td class="an-num">${fmtNum(d.pv)}</td><td class="an-num">${fmtNum(d.req)}</td><td class="an-num">${fmtSize(d.bytes)}</td></tr>`).join('')}
+            </tbody></table></details>
+        </div>
+        <div class="an-grid">
+          ${topTable('Top pages', data.paths, t.pageviews, (k) => `<span class="mono">${esc(k)}</span>`)}
+          ${topTable('Referrers', data.referrers, t.pageviews)}
+          ${topTable('Countries', data.countries, t.pageviews, (k) => `${flag(k)} ${esc(k)}`)}
+          ${topTable('Addresses used', data.hosts, t.pageviews, (k) => `<span class="mono">${esc(k)}</span>`)}
+        </div>
+        <p class="muted small">Counted by Pagemaster from the requests it serves: no cookies, no tracking script. Visitors are counted once per day (an anonymous daily hash of IP + browser), so the total adds up each day's visitors. Countries come from Cloudflare and only show for traffic through a tunnel or Cloudflare proxy. Previews in this panel are not counted.</p>
+        ${s.my && s.my.manage ? '<div class="row"><button class="btn sm danger" id="an-reset">Reset analytics</button></div>' : ''}`;
+      columnChart($('#an-chart', el), data.series, metric, metric === 'uv' ? 'Visitors' : 'Page views');
+      $$('#an-metric [data-m]', el).forEach((b) => { b.onclick = () => { metric = b.dataset.m; render(); }; });
+      if ($('#an-reset', el)) $('#an-reset', el).onclick = async () => {
+        if (!(await confirmBox(`Delete all analytics for "${s.name}"?`, 'Reset'))) return;
+        try { await api('DELETE', `/api/sites/${s.id}/analytics`); load(); } catch (e) { toast(e.message, 'error'); }
+      };
+    };
+    const load = async () => {
+      try { data = await api('GET', `/api/sites/${s.id}/analytics?days=${days}`); render(); } catch (e) { toast(e.message, 'error'); }
+    };
+    $$('#an-days [data-d]', el).forEach((b) => { b.onclick = () => {
+      days = +b.dataset.d;
+      $$('#an-days [data-d]', el).forEach((x) => x.classList.toggle('on', x === b));
+      load();
+    }; });
+    load();
   }
 
   async function siteForm(s) {
@@ -480,11 +767,11 @@
 
   // ------------------------------------------------------------------ files
   async function pageFiles(el) {
-    const w = can('files.write');
+    const w = can('files.write') || state.siteAccess.files;
     el.innerHTML = `
       <div class="page-head">
-        <div><h1>Files</h1><p>Browse the cloned site folders.</p></div>
-        ${w ? `<div class="row">
+        <div><h1>Files</h1><p>Browse the cloned site folders.${can('files.read') ? '' : ' You see the sites shared with you.'}</p></div>
+        ${w ? `<div class="row" id="file-tools">
           <button class="btn" id="new-folder">New folder</button>
           <button class="btn" id="new-file">New file</button>
           <label class="btn primary">Upload<input type="file" id="upload" multiple hidden></label>
@@ -505,7 +792,7 @@
       const card = $('#filecard');
       card.addEventListener('dragover', (e) => { e.preventDefault(); card.classList.add('drag'); });
       card.addEventListener('dragleave', () => card.classList.remove('drag'));
-      card.addEventListener('drop', (e) => { e.preventDefault(); card.classList.remove('drag'); uploadFiles(e.dataTransfer.files); });
+      card.addEventListener('drop', (e) => { e.preventDefault(); card.classList.remove('drag'); if (state.filesWritable) uploadFiles(e.dataTransfer.files); else toast('You cannot upload here', 'error'); });
     }
     loadFiles();
   }
@@ -528,11 +815,13 @@
     try { data = await api('GET', '/api/files/list?path=' + encodeURIComponent(state.filesPath)); }
     catch (e) { toast(e.message, 'error'); state.filesPath = '/'; data = await api('GET', '/api/files/list?path=/'); }
     state.filesPath = data.path;
+    state.filesWritable = !!data.writable;
+    if ($('#file-tools')) $('#file-tools').style.visibility = data.writable ? '' : 'hidden';
     const parts = data.path.split('/').filter(Boolean);
     $('#crumbs').innerHTML = `<a href="#" data-p="/">sites</a>` + parts.map((p, i) =>
       ` / <a href="#" data-p="/${esc(parts.slice(0, i + 1).join('/'))}">${esc(p)}</a>`).join('');
     $$('#crumbs a').forEach((a) => a.onclick = (e) => { e.preventDefault(); state.filesPath = a.dataset.p; loadFiles(); });
-    const w = can('files.write');
+    const w = data.writable;
     $('#filelist').innerHTML = data.entries.length ? `<table>
       <thead><tr><th>Name</th><th class="hide-sm">Size</th><th class="hide-sm">Modified</th><th></th></tr></thead>
       <tbody>
@@ -576,14 +865,14 @@
 
   async function editFile(p) {
     let content = '';
+    let w = state.filesWritable;
     if (p) {
-      try { content = (await api('GET', '/api/files/read?path=' + encodeURIComponent(p))).content; }
+      try { const r = await api('GET', '/api/files/read?path=' + encodeURIComponent(p)); content = r.content; w = r.writable; }
       catch (e) {
         if (confirm(e.message + '\n\nDownload it?')) location.href = '/api/files/download?path=' + encodeURIComponent(p);
         return;
       }
     }
-    const w = can('files.write');
     modal(`<div class="row" style="margin-bottom:10px">
         ${p ? `<h2 class="grow mono" style="margin:0">${esc(p)}</h2>` : `<input type="text" id="fname" class="grow" placeholder="file name, e.g. index.html" style="width:auto">`}
       </div>
@@ -789,6 +1078,7 @@
           ${t.enabled ? '<button class="btn sm" data-a="stop">■ Stop</button>' : '<button class="btn sm" data-a="start">▶ Start</button>'}
           <button class="btn sm" data-a="log">Logs</button>
           ${t.mode === 'api' ? '<button class="btn sm" data-a="token">Update API token</button>' : ''}
+          <button class="btn sm" data-a="transfer">Transfer</button>
           <button class="btn sm danger" data-a="delete">Delete tunnel</button>
         </div>
       </div>`).join('');
@@ -800,6 +1090,7 @@
           if (a === 'route') return routeForm(t);
           if (a === 'log') return showTunnelLog(t);
           if (a === 'token') return updateTokenForm(t);
+          if (a === 'transfer') return transferTunnel(t);
           if (a === 'dns') {
             const r = t.routes.find((x) => x.id === b.closest('tr').dataset.rid);
             return manualDnsModal(`Pagemaster could not create the DNS record for ${r.hostname} because the API token lacks DNS permission.`,
@@ -1012,6 +1303,24 @@
     });
   }
 
+  async function transferTunnel(t) {
+    let users;
+    try { users = (await directory()).filter((u) => u.id !== t.userId && u.canTunnel); } catch (e) { return toast(e.message, 'error'); }
+    if (!users.length) return toast('No other user has the tunnels.manage permission', 'error');
+    modal(`<h2>Transfer tunnel "${esc(t.name)}"</h2>
+      <p>The new owner can manage this tunnel and its public hostnames. Its Cloudflare API token goes with it, so they can act on that Cloudflare account through Pagemaster.</p>
+      <form id="tt-form"><label class="field"><span>New owner</span><select name="userId">${users.map((u) => `<option value="${esc(u.id)}">${esc(u.username)}</option>`).join('')}</select></label>
+      <div class="modal-foot"><button type="button" class="btn" data-close>Cancel</button><button class="btn danger solid">Transfer</button></div></form>`, {
+      onMount: (m, close) => {
+        $('#tt-form', m).onsubmit = async (e) => {
+          e.preventDefault();
+          try { await api('POST', `/api/tunnels/${t.id}/transfer`, formData(e.target)); toast('Tunnel transferred', 'ok'); close(); renderTunnels(await api('GET', '/api/tunnels')); }
+          catch (ex) { toast(ex.message, 'error'); }
+        };
+      },
+    });
+  }
+
   function showTunnelLog(t) {
     const m = modal(`<div class="row"><h2 class="grow" style="margin:0">cloudflared — ${esc(t.name)}</h2><button class="btn sm" data-close>Close</button></div>
       <pre class="logbox mono" id="tlog" style="margin-top:12px">Loading…</pre>`, { wide: true });
@@ -1042,16 +1351,16 @@
     $('#user-list').innerHTML = `<table><thead><tr><th>User</th><th>Type</th><th class="hide-sm">Access</th><th class="hide-sm">Last login</th><th></th></tr></thead><tbody>
       ${list.map((u) => `<tr data-id="${esc(u.id)}">
         <td><b>${esc(u.username)}</b>${u.email ? `<div class="muted small">${esc(u.email)}</div>` : ''}</td>
-        <td>${u.source === 'sso' ? '<span class="tag">SSO</span>' : '<span class="tag">Local</span>'}${u.disabled ? ' <span class="badge error">disabled</span>' : ''}</td>
+        <td>${u.source === 'sso' ? '<span class="tag">SSO</span>' : '<span class="tag">Local</span>'}${u.source !== 'sso' && u.ssoLinked ? `<span class="tag" title="Can also sign in with SSO as ${esc(u.ssoName)}">+ SSO</span>` : ''}${u.disabled ? ' <span class="badge error">disabled</span>' : ''}</td>
         <td class="hide-sm">${u.isAdmin ? '<span class="badge live">Admin</span>' : (u.permissions.length ? u.permissions.map((p) => `<span class="tag">${esc(p)}</span>`).join('') : '<span class="muted">no access</span>')}</td>
         <td class="hide-sm muted">${fmtTime(u.lastLogin)}</td>
         <td style="text-align:right;white-space:nowrap"><button class="btn sm" data-a="edit">Edit</button>${u.id !== state.user.id ? '<button class="btn sm danger" data-a="rm">Delete</button>' : ''}</td>
       </tr>`).join('')}</tbody></table>`;
     $$('#user-list tr[data-id]').forEach((tr) => {
       const u = list.find((x) => x.id === tr.dataset.id);
-      $('[data-a=edit]', tr).onclick = () => userForm(u);
+      $('[data-a=edit]', tr).onclick = () => userForm(u, list);
       if ($('[data-a=rm]', tr)) $('[data-a=rm]', tr).onclick = async () => {
-        if (!(await confirmBox(`Delete user "${u.username}"?`))) return;
+        if (!(await confirmBox(`Delete user "${u.username}"? Sites they own will be transferred to you, and their Cloudflare tunnels are deleted.`))) return;
         try { await api('DELETE', `/api/users/${u.id}`); loadUsers(); } catch (e) { toast(e.message, 'error'); }
       };
     });
@@ -1063,8 +1372,9 @@
       <span><code>${esc(k)}</code> <span class="muted small">— ${esc(d)}</span></span></label>`).join('');
   }
 
-  function userForm(u) {
+  function userForm(u, all = []) {
     const editing = !!u;
+    const ssoUsers = editing ? all.filter((x) => x.id !== u.id && x.ssoLinked && x.id !== state.user.id) : [];
     u = u || { permissions: ['sites.view'], source: 'local' };
     modal(`<h2>${editing ? 'Edit user' : 'Add user'}</h2>
       <form id="user-form">
@@ -1073,6 +1383,12 @@
         <label class="check"><input type="checkbox" name="mustChangePassword" ${!editing ? 'checked' : ''}> <span>Ask user to change password on next login</span></label>` : '<p class="muted small">SSO account — signs in through your identity provider.</p>'}
         ${state.user.isAdmin ? `<label class="check"><input type="checkbox" name="isAdmin" id="isadmin" ${u.isAdmin ? 'checked' : ''}> <span><b>Administrator</b> — full access to everything</span></label>` : ''}
         ${editing && u.id !== state.user.id ? `<label class="check"><input type="checkbox" name="disabled" ${u.disabled ? 'checked' : ''}> <span>Disabled (cannot sign in)</span></label>` : ''}
+        ${editing && u.ssoLinked ? `<div class="card" style="margin:10px 0;padding:10px 12px"><b>SSO identity:</b> <span class="mono">${esc(u.ssoName || 'linked')}</span>
+          ${u.hasPassword ? '<label class="check"><input type="checkbox" name="unlinkSso"> <span>Unlink SSO (the user keeps signing in with their password)</span></label>' : ''}</div>` : ''}
+        ${editing && state.user.isAdmin && ssoUsers.length ? `<label class="field"><span>Link an SSO user into this account</span><select name="linkFrom">
+            <option value="">— no change —</option>
+            ${ssoUsers.map((x) => `<option value="${esc(x.id)}">${esc(x.username)}${x.ssoName ? ' (' + esc(x.ssoName) + ')' : ''}</option>`).join('')}</select>
+          <small>Use this when SSO created a second account for the same person. That account's SSO login, sites, shares and tunnels move here, and it is deleted.</small></label>` : ''}
         <h3 style="margin-top:14px">Permissions</h3>
         <div id="perms">${permChecks(u.permissions)}</div>
         <div class="modal-foot"><button type="button" class="btn" data-close>Cancel</button><button class="btn primary">Save</button></div>
@@ -1087,9 +1403,17 @@
           const body = formData(e.target);
           if (!body.password) delete body.password;
           if (!state.user.isAdmin) delete body.isAdmin;
+          const linkFrom = body.linkFrom;
+          delete body.linkFrom;
+          if (linkFrom) {
+            const from = ssoUsers.find((x) => x.id === linkFrom);
+            if (!(await confirmBox(`Merge "${from.username}" into "${u.username}"? "${from.username}" will be deleted and its SSO login will sign in as "${u.username}".`, 'Merge'))) return;
+          }
           try {
             if (editing) await api('PUT', `/api/users/${u.id}`, body);
             else await api('POST', '/api/users', body);
+            if (linkFrom) await api('POST', `/api/users/${u.id}/link-sso`, { fromUserId: linkFrom });
+            state.directory = null;
             close();
             loadUsers();
             toast('Saved', 'ok');
@@ -1167,7 +1491,14 @@
       <div class="card"><h2>Username</h2>
         <form id="un-form" class="row"><input type="text" name="username" value="${esc(u.username)}" style="max-width:300px" required><button class="btn primary">Save</button></form>
       </div>
-      ${u.source === 'local' ? `<div class="card" style="max-width:520px"><h2>Change password</h2>
+      ${state.ssoEnabled || u.ssoLinked ? `<div class="card" style="max-width:520px"><h2>Single sign-on</h2>
+        ${u.ssoLinked
+          ? `<p>Linked to the SSO account <b class="mono">${esc(u.ssoName || '(linked)')}</b>. Signing in with SSO opens this account.</p>
+             ${u.hasPassword ? '<button class="btn danger" id="sso-unlink">Unlink SSO</button>' : '<p class="muted small">This account has no password, so SSO is its only way to sign in.</p>'}`
+          : `<p>Link your SSO account so <b>${esc(state.ssoEnabled ? 'Sign in with SSO' : 'SSO')}</b> opens this account (with its sites and permissions) instead of creating a new one. Your password keeps working.</p>
+             <button class="btn primary" id="sso-link">Link SSO account</button>`}
+      </div>` : ''}
+      ${u.hasPassword || u.source === 'local' ? `<div class="card" style="max-width:520px"><h2>Change password</h2>
         <form id="pw-form">
           <label class="field"><span>Current password</span><input type="password" name="current" required autocomplete="current-password"></label>
           <label class="field"><span>New password</span><input type="password" name="password" required minlength="8" autocomplete="new-password"></label>
@@ -1179,6 +1510,13 @@
       e.preventDefault();
       try { await api('POST', '/api/account/username', formData(e.target)); u.username = formData(e.target).username; toast('Username changed', 'ok'); renderShell(); go('account'); }
       catch (ex) { toast(ex.message, 'error'); }
+    };
+    if ($('#sso-link')) $('#sso-link').onclick = async () => {
+      try { location.href = (await api('POST', '/api/account/sso/link')).url; } catch (ex) { toast(ex.message, 'error'); }
+    };
+    if ($('#sso-unlink')) $('#sso-unlink').onclick = async () => {
+      if (!(await confirmBox('Unlink SSO? You will only be able to sign in with your password.', 'Unlink'))) return;
+      try { state.user = (await api('POST', '/api/account/sso/unlink')).user; toast('SSO unlinked', 'ok'); go('account'); } catch (ex) { toast(ex.message, 'error'); }
     };
     if ($('#pw-form')) $('#pw-form').onsubmit = async (e) => {
       e.preventDefault();
