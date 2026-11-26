@@ -12,6 +12,7 @@ const sso = require('./sso');
 const sites = require('./sites');
 const files = require('./files');
 const terminal = require('./terminal');
+const cloudflare = require('./cloudflare');
 
 const { db, save, id, encrypt, PERMISSIONS } = store;
 store.load();
@@ -25,7 +26,7 @@ app.use(auth.attachUser);
 app.use((req, res, next) => {
   res.set('X-Frame-Options', 'SAMEORIGIN');
   res.set('X-Content-Type-Options', 'nosniff');
-  res.set('Referrer-Policy', 'same-origin');
+  res.set('Referrer-Policy', 'strict-origin-when-cross-origin');
   next();
 });
 
@@ -98,6 +99,8 @@ app.get('/api/system', auth.requireAuth, (_req, res) => {
   res.json({
     adminPort: config.ADMIN_PORT,
     hostingPort: config.HOSTING_PORT,
+    hostingPublicPort: config.HOSTING_PUBLIC_PORT,
+    sitesUrl: d.settings.sitesUrl || '',
     sitePortRange: config.SITE_PORT_RANGE,
     usedPorts: d.sites.filter((s) => s.port).map((s) => ({ port: s.port, site: s.name })),
     sitesBaseDomain: d.settings.sitesBaseDomain || '',
@@ -130,6 +133,7 @@ app.put('/api/sites/:id', P('sites.manage'), json, wrap(async (req, res) => {
 }));
 app.delete('/api/sites/:id', P('sites.manage'), wrap(async (req, res) => {
   findSite(req);
+  await cloudflare.removeSiteRoutes(req.params.id);
   await sites.remove(req.params.id);
   res.json({ ok: true });
 }));
@@ -283,24 +287,26 @@ app.put('/api/users/:id', P('users.manage'), json, (req, res) => {
   save();
   res.json(auth.publicUser(u));
 });
-app.delete('/api/users/:id', P('users.manage'), (req, res) => {
+app.delete('/api/users/:id', P('users.manage'), wrap(async (req, res) => {
   const d = db();
   const u = d.users.find((x) => x.id === req.params.id);
   if (!u) return res.status(404).json({ error: 'Not found' });
   if (u.id === req.user.id) return res.status(400).json({ error: 'You cannot delete yourself' });
   if (u.isAdmin && !req.user.isAdmin) return res.status(403).json({ error: 'Only admins can delete admins' });
   if (u.isAdmin && adminCount() <= 1) return res.status(400).json({ error: 'At least one active admin is required' });
+  await cloudflare.removeUserTunnels(u.id);
   d.users = d.users.filter((x) => x.id !== u.id);
   auth.destroyUserSessions(u.id);
   save();
   res.json({ ok: true });
-});
+}));
 
 // ------------------------------------------------------------------ settings
 function settingsOut(req) {
   const s = db().settings;
   return {
     publicUrl: s.publicUrl,
+    sitesUrl: s.sitesUrl || '',
     sitesBaseDomain: s.sitesBaseDomain,
     sso: { ...s.sso, clientSecret: undefined, hasClientSecret: !!s.sso.clientSecret },
     ssoRedirectUri: sso.redirectUri(req),
@@ -315,6 +321,11 @@ app.put('/api/settings', P('settings.manage'), json, (req, res) => {
     if (u && !/^https?:\/\/[^\s/]+$/.test(u)) return res.status(400).json({ error: 'Public URL must be like https://pagemaster.example.com' });
     s.publicUrl = u;
   }
+  if (b.sitesUrl !== undefined) {
+    const u = String(b.sitesUrl).trim().replace(/\/+$/, '');
+    if (u && !/^https?:\/\/[^\s/]+$/.test(u)) return res.status(400).json({ error: 'Sites URL must be like http://192.168.1.50 or https://sites.example.com (no path)' });
+    s.sitesUrl = u;
+  }
   if (b.sitesBaseDomain !== undefined) {
     const dmn = String(b.sitesBaseDomain).trim().toLowerCase().replace(/^\*?\./, '');
     if (dmn && !/^[a-z0-9.-]+\.[a-z]{2,}$/.test(dmn)) return res.status(400).json({ error: 'Invalid base domain' });
@@ -324,6 +335,11 @@ app.put('/api/settings', P('settings.manage'), json, (req, res) => {
       for (const h of [...(site.domains || []), ...(dmn ? [`${site.slug}.${dmn}`] : [])]) {
         if (hosts.has(h) && hosts.get(h) !== site.id) return res.status(400).json({ error: `Base domain would make ${h} point to two sites` });
         hosts.set(h, site.id);
+      }
+    }
+    for (const t of db().tunnels) {
+      for (const r of t.routes || []) {
+        if (hosts.has(r.hostname) && hosts.get(r.hostname) !== r.siteId) return res.status(400).json({ error: `Base domain clashes with tunnel hostname ${r.hostname}` });
       }
     }
     s.sitesBaseDomain = dmn;
@@ -347,6 +363,24 @@ app.put('/api/settings', P('settings.manage'), json, (req, res) => {
   save();
   res.json(settingsOut(req));
 });
+
+// ------------------------------------------------------------------ cloudflare tunnels (per user)
+const T = P('tunnels.manage');
+app.post('/api/cloudflare/inspect', T, json, wrap(async (req, res) => res.json(await cloudflare.inspectToken(String(req.body.apiToken || '').trim()))));
+app.get('/api/tunnels', T, (req, res) => res.json(cloudflare.list(req.user)));
+app.get('/api/tunnels/sites', T, (_req, res) => res.json(db().sites.map((s) => ({ id: s.id, name: s.name, slug: s.slug }))));
+app.post('/api/tunnels', T, json, wrap(async (req, res) => res.json(await cloudflare.create(req.user, req.body))));
+app.delete('/api/tunnels/:id', T, wrap(async (req, res) => res.json(await cloudflare.remove(req.user, req.params.id))));
+app.post('/api/tunnels/:id/start', T, wrap(async (req, res) => res.json(await cloudflare.setEnabled(req.user, req.params.id, true))));
+app.post('/api/tunnels/:id/stop', T, wrap(async (req, res) => res.json(await cloudflare.setEnabled(req.user, req.params.id, false))));
+app.get('/api/tunnels/:id/zones', T, wrap(async (req, res) => {
+  const t = cloudflare.get(req.user, req.params.id);
+  if (t.mode !== 'api') return res.json([]);
+  res.json(await cloudflare.listZones(t));
+}));
+app.post('/api/tunnels/:id/routes', T, json, wrap(async (req, res) => res.json(await cloudflare.addRoute(req.user, req.params.id, req.body))));
+app.delete('/api/tunnels/:id/routes/:rid', T, wrap(async (req, res) => res.json(await cloudflare.removeRoute(req.user, req.params.id, req.params.rid))));
+app.get('/api/tunnels/:id/log', T, (req, res) => res.type('text/plain').send(cloudflare.readLog(req.user, req.params.id)));
 
 // ------------------------------------------------------------------ files
 app.use('/api/files', files.router());
@@ -374,10 +408,11 @@ hostingServer.on('upgrade', sites.hostingUpgrade);
 hostingServer.listen(config.HOSTING_PORT, '0.0.0.0', () => console.log(`[pagemaster] Shared site hosting on port ${config.HOSTING_PORT}`));
 
 sites.startAll().catch((e) => console.error('[sites] startup error', e));
+cloudflare.startAll();
 
 async function stop() {
   console.log('[pagemaster] shutting down');
-  await sites.shutdown();
+  await Promise.all([sites.shutdown(), cloudflare.shutdown()]);
   process.exit(0);
 }
 process.on('SIGTERM', stop);

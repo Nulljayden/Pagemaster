@@ -10,28 +10,33 @@ A self-hosted control panel for hosting websites straight from git repositories.
 - **Built-in terminal**, a full shell inside the container in your browser.
 - **User management** with fine-grained permissions. The default login is **`admin` / `admin`**, and you get a prompt to change it on first sign-in.
 - **SSO (OpenID Connect)** for Authentik, Authelia, Keycloak, Zitadel, Pocket ID, Google, Entra ID and others. Local login stays available. New SSO users get the **lowest access** (`sites.view` only) until an admin raises it.
+- **Slug URLs, no ports.** Every site lives at `http://server/<slug>/`. Apps that redirect to `/login` or link to `/assets/...` still work under the slug: redirects and cookies are rewritten, and absolute links get routed back into the right site.
+- **Live site previews.** Each site card shows a thumbnail, and the preview window has desktop, tablet and phone sizes.
+- **Cloudflare Tunnels per user.** Each user connects their own Cloudflare account (API token) and publishes sites at `https://<sub>.<their domain>`. Pagemaster creates the tunnel, public hostnames and DNS records, and runs `cloudflared`. A pasted tunnel token also works.
 - **No port or URL overlap.** Each slug, domain and dedicated port can belong to only one site. Pagemaster rejects ports already used by another site, the admin UI, the shared hosting port, or any other program, so two repos never answer on the same address.
 
 ---
 
-## Ports
+## Ports & addresses
 
-| Port | Purpose |
-|---|---|
-| `8080` | Admin web UI (`ADMIN_PORT`) |
-| `8081` | Shared hosting port (`HOSTING_PORT`). Serves every site by **domain**, by **`<slug>.<base domain>`**, or by path **`/<slug>/`** |
-| `8100-8199` | Range a site can claim as its **own dedicated port** (`SITE_PORT_RANGE`) |
+| Container port | Published as | Purpose |
+|---|---|---|
+| `8080` | `8080` | Admin web UI (`ADMIN_PORT`) |
+| `8081` | **`80`** | All sites (`HOSTING_PORT`), at **`http://server/<slug>/`** |
+| `8100-8199` | *(not published by default)* | Optional dedicated per-site ports (Advanced, rarely needed) |
 
-App-type sites also get an internal port (`20000-20999`, loopback only). Pagemaster assigns it, it never collides with another site, and the app reads it from `$PORT`.
-
-> The ports published in Docker must match the env vars. If you change `SITE_PORT_RANGE` to `9000-9050`, publish `9000-9050:9000-9050`.
+`HOSTING_PUBLIC_PORT` tells Pagemaster which host port the sites are published on, so the links it shows match. With `80` the links have no port. App-type sites also get an internal loopback port (`20000-20999`), assigned automatically, never shared, and passed to the app as `$PORT`.
 
 ### Ways to reach a site
 
-1. **Path:** `http://SERVER:8081/<slug>/`. Works right away, but sites that use absolute asset paths (`/assets/app.js`) may break when served under a sub-path.
-2. **Dedicated port:** `http://SERVER:8100/`. Easiest, with no reverse proxy needed.
-3. **Domain:** point `www.example.com` at your reverse proxy, forward it to `SERVER:8081`, and add the domain to the site.
-4. **Wildcard:** set **Settings → Sites base domain** to `sites.example.com`, point `*.sites.example.com` at port 8081, and every site appears at `<slug>.sites.example.com`.
+1. **Slug (default):** `http://SERVER/<slug>/`. Works right away, with no DNS needed.
+2. **Cloudflare Tunnel:** `https://<slug>.yourdomain.com` from anywhere, with no port-forwarding. See [Cloudflare Tunnels](#cloudflare-tunnels-per-user).
+3. **Your own domain / reverse proxy:** point `www.example.com` at `SERVER:80` and add the domain to the site (Edit → Advanced).
+4. **Wildcard:** set **Settings → Sites base domain** to `sites.example.com`, point `*.sites.example.com` at the server, and every site appears at `<slug>.sites.example.com`.
+
+If you reach the sites through a reverse proxy, set **Settings → Sites URL** (e.g. `https://sites.example.com`) so the panel shows `https://sites.example.com/<slug>/`.
+
+**How slug paths handle apps written for `/`:** Pagemaster rewrites app redirects (`/login` becomes `/<slug>/login`) and scopes the app's cookies to `/<slug>/`, so two apps can't overwrite each other's logins. When a page under `/<slug>/` requests an absolute path like `/static/app.css`, it redirects that request into `/<slug>/static/app.css`, using the page's Referer or a "last site visited" cookie to pick the site. One limit: if an app links to `/foo/...` and another site has the slug `foo`, that link goes to the `foo` site. Use a tunnel or domain for that app.
 
 ---
 
@@ -56,18 +61,22 @@ services:
       - TZ=America/New_York
       - ADMIN_PORT=8080
       - HOSTING_PORT=8081
-      - SITE_PORT_RANGE=8100-8199
+      - HOSTING_PUBLIC_PORT=80
     ports:
       - "8080:8080"
-      - "8081:8081"
-      - "8100-8199:8100-8199"
+      - "80:8081"
     volumes:
       - /mnt/tank/apps/pagemaster:/data
 ```
 
 4. Open `http://TRUENAS-IP:8080` and sign in with `admin` / `admin`.
 
-If 8080 or 8081 is already taken on the NAS, change **both** the env var and the port mapping, e.g. `ADMIN_PORT=9080` with `"9080:9080"`.
+> **Port 80 on TrueNAS:** the TrueNAS web interface uses ports 80 and 443 by default, so the app won't start until you free them. Pick one:
+> - **Move the TrueNAS UI:** System → General Settings → GUI → Settings, set *Web Interface HTTP Port* to e.g. `81` and *HTTPS Port* to `444`, then save. Afterwards the NAS UI is at `http://TRUENAS-IP:81`.
+> - **Give Pagemaster its own IP:** add an alias IP on the NAS interface and publish `"192.168.1.60:80:8081"`.
+> - **Skip port 80** and only use Cloudflare Tunnels or a reverse proxy: publish e.g. `"8081:8081"` with `HOSTING_PUBLIC_PORT=8081`, or set **Settings → Sites URL** to your proxy address.
+>
+> If 8080 is already taken, change **both** `ADMIN_PORT` and the mapping, e.g. `ADMIN_PORT=9080` with `"9080:9080"`.
 
 ### Proxmox VE
 
@@ -96,7 +105,7 @@ cd /opt/pagemaster && docker compose up -d
 
 ```bash
 docker run -d --name pagemaster --restart unless-stopped \
-  -p 8080:8080 -p 8081:8081 -p 8100-8199:8100-8199 \
+  -p 8080:8080 -p 80:8081 \
   -v /srv/pagemaster:/data ghcr.io/nulljayden/pagemaster:latest
 ```
 
@@ -140,6 +149,7 @@ The image includes Node 22, npm, git and ssh. If you need another runtime (Pytho
 | `credentials.manage` | Git tokens & SSH key |
 | `files.read` / `files.write` | File browser read / write |
 | `terminal` | Shell in the container. **This is effectively full access**, so only give it to people you trust |
+| `tunnels.manage` | Connect **their own** Cloudflare account and publish sites through **their own** tunnels. Users only ever see their own tunnels; admins see all |
 | `users.manage` | Manage users (non-admins can only grant permissions they have themselves) |
 | `settings.manage` | SSO & system settings |
 
@@ -151,6 +161,31 @@ Admins have everything. At least one active admin always has to exist.
 2. Set the redirect URI to `https://YOUR-PAGEMASTER/auth/sso/callback`. The exact value is shown in **Settings**, so set **Public URL** first if you use a reverse proxy.
 3. In Pagemaster **Settings**, enter the issuer URL, client ID and secret, then tick **Enable SSO login**.
 4. New SSO users only get the permissions ticked under *Default permissions*. Raise their access in **Users**.
+
+## Cloudflare Tunnels (per user)
+
+Each user with the `tunnels.manage` permission can connect **their own** Cloudflare account on the **Tunnels** page. Users can't see or change each other's tunnels; admins can see all of them. When a user is deleted, their tunnels are deleted too, including the tunnel and DNS records Pagemaster created in their Cloudflare account.
+
+**API token mode (recommended).** Pagemaster does all the Cloudflare work.
+
+1. In Cloudflare, go to **My Profile → API Tokens → Create Token → Custom token** with these permissions:
+   - Account → **Cloudflare Tunnel** → Edit
+   - Zone → **DNS** → Edit
+   - Zone → **Zone** → Read
+
+   Under *Zone Resources*, pick the domains you want to use.
+2. In Pagemaster, go to **Tunnels → + Connect Cloudflare**, paste the token, click **Check token**, pick the account, then **Create tunnel**.
+3. Click **+ Publish a site**, pick the site, a subdomain (defaults to the slug) and the domain. Pagemaster adds the tunnel's public hostname and a proxied `CNAME` record. The site is live at `https://<sub>.<domain>` within a minute.
+
+Removing a hostname or deleting the tunnel cleans up the DNS records and the tunnel in Cloudflare. Pagemaster refuses to touch a DNS name that already has a different record, so it won't overwrite an existing site.
+
+**Tunnel token mode.** Use this if you already manage the tunnel yourself.
+
+1. In Zero Trust go to **Networks → Tunnels → Create a tunnel (Cloudflared)**, and copy the install command or token.
+2. In Pagemaster, go to **Tunnels → + Connect Cloudflare → Tunnel token** and paste it. Any of Cloudflare's install commands works.
+3. In the Cloudflare dashboard, add a public hostname with service **HTTP** → `localhost:8081`. Then in Pagemaster use **+ Publish a site** with the same hostname.
+
+`cloudflared` runs inside the Pagemaster container, one process per tunnel. It restarts automatically and shows its status (connected, starting, error) and logs on the Tunnels page. Tunnels connect outbound only, so you don't need port 80, port-forwarding or a public IP.
 
 ## Reverse proxy / HTTPS
 
@@ -205,6 +240,8 @@ Snapshot that dataset or folder to back up. Deleting `pagemaster.json` resets th
 |---|---|---|
 | `ADMIN_PORT` | `8080` | Admin UI port |
 | `HOSTING_PORT` | `8081` | Shared hosting port |
+| `HOSTING_PUBLIC_PORT` | `80` (image) | Host port the sites are published on; used for the links shown in the UI |
+| `CLOUDFLARED_BIN` | `cloudflared` | Path to cloudflared (bundled in the image) |
 | `SITE_PORT_RANGE` | `8100-8199` | Allowed dedicated site ports |
 | `APP_PORT_RANGE` | `20000-20999` | Internal app ports (not published) |
 | `DATA_DIR` | `/data` | Data location |

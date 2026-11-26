@@ -130,6 +130,13 @@ async function validate(input, existingId) {
     const clash = hostsFor(o, base).filter((h) => myHosts.includes(h));
     if (clash.length) errors.push(`Domain ${clash.join(', ')} is already used by site "${o.name}"`);
   }
+  for (const t of d.tunnels || []) {
+    for (const r of t.routes || []) {
+      if (r.siteId !== existingId && myHosts.includes(r.hostname)) {
+        errors.push(`Domain ${r.hostname} is already published to another site through a Cloudflare tunnel`);
+      }
+    }
+  }
 
   // Dedicated port
   let port = null;
@@ -435,7 +442,23 @@ function staticHandler(site) {
   return app;
 }
 
+// Is this request the admin panel's preview iframe? Then allow framing even if
+// the app sends X-Frame-Options / CSP frame-ancestors (only for that request).
+function isPreview(req) {
+  if (req.headers['sec-fetch-dest'] !== 'iframe') return false;
+  const ref = req.headers.referer;
+  if (!ref) return false;
+  try {
+    const u = new URL(ref);
+    const pub = db().settings.publicUrl;
+    if (pub && new URL(pub).origin === u.origin) return true;
+    const host = String(req.headers.host || '').replace(/:\d+$/, '');
+    return u.hostname === host && u.port === String(config.ADMIN_PORT);
+  } catch (_) { return false; }
+}
+
 function serveSite(site, req, res) {
+  req._pmPreview = isPreview(req);
   if (site.enabled === false) {
     res.writeHead(503, { 'Content-Type': 'text/plain' });
     return res.end('This site is currently stopped.');
@@ -448,39 +471,124 @@ function serveSite(site, req, res) {
     if (!site.internalPort) { res.writeHead(503); return res.end('App not started'); }
     return proxy.web(req, res, { target: `http://127.0.0.1:${site.internalPort}` });
   }
+  if (res._pmCookie) res.setHeader('Set-Cookie', res._pmCookie);
   staticHandler(site)(req, res);
 }
 
+// When an app is served under /<slug>/, fix up what it sends back:
+// redirects to "/login" become "/<slug>/login" and cookies are scoped to /<slug>/
+// so two apps on the same host can't overwrite each other's sessions.
+function prefixPath(p, prefix) {
+  if (p === prefix || p.startsWith(prefix + '/') || p.startsWith(prefix + '?')) return p;
+  return prefix + p;
+}
+proxy.on('proxyRes', (proxyRes, req, res) => {
+  const prefix = req._pmPrefix;
+  const h = proxyRes.headers;
+  if (prefix) {
+    if (h.location) {
+      const loc = String(h.location);
+      if (loc.startsWith('/') && !loc.startsWith('//')) {
+        h.location = prefixPath(loc, prefix);
+      } else {
+        try {
+          const u = new URL(loc);
+          const host = String(req.headers.host || '');
+          if (u.host === host || ['127.0.0.1', 'localhost'].includes(u.hostname)) {
+            h.location = prefixPath(u.pathname, prefix) + u.search + u.hash;
+          }
+        } catch (_) { /* relative redirect, leave as is */ }
+      }
+    }
+    if (h['set-cookie']) {
+      h['set-cookie'] = [].concat(h['set-cookie']).map((c) =>
+        /;\s*path=/i.test(c)
+          ? c.replace(/;\s*path=([^;]*)/i, (_m, p) => `; Path=${prefixPath(p.trim().startsWith('/') ? p.trim() : '/' + p.trim(), prefix)}`)
+          : `${c}; Path=${prefix}/`);
+    }
+  }
+  if (res._pmCookie) h['set-cookie'] = [].concat(h['set-cookie'] || [], res._pmCookie);
+  if (req._pmPreview) {
+    delete h['x-frame-options'];
+    if (h['content-security-policy']) {
+      h['content-security-policy'] = String(h['content-security-policy']).replace(/frame-ancestors[^;]*;?/i, '');
+    }
+  }
+});
+
+function cookieVal(req, name) {
+  const m = String(req.headers.cookie || '').match(new RegExp('(?:^|;\\s*)' + name + '=([^;]+)'));
+  return m ? decodeURIComponent(m[1]) : null;
+}
+
+// Hostname -> site for Cloudflare tunnel routes
+function tunnelSite(d, host) {
+  for (const t of d.tunnels || []) {
+    for (const r of t.routes || []) {
+      if (r.hostname === host) return d.sites.find((s) => s.id === r.siteId) || null;
+    }
+  }
+  return null;
+}
+
 // Resolve a site for a request on the shared hosting port.
-// Order: exact domain -> <slug>.<baseDomain> -> /<slug>/ path prefix
+// Order: custom domain -> Cloudflare tunnel hostname -> <slug>.<baseDomain>
+//        -> /<slug>/ path -> fallback for absolute links made by a /<slug>/ site
 function resolve(req) {
   const d = db();
   const host = String(req.headers.host || '').replace(/:\d+$/, '').toLowerCase();
   const base = (d.settings.sitesBaseDomain || '').toLowerCase();
   for (const s of d.sites) if ((s.domains || []).includes(host)) return { site: s };
+  const ts = tunnelSite(d, host);
+  if (ts) return { site: ts };
   if (base && host.endsWith('.' + base)) {
     const slug = host.slice(0, -(base.length + 1));
     const s = d.sites.find((x) => x.slug === slug);
     if (s) return { site: s };
   }
-  const m = (req.url || '').match(/^\/([a-z0-9-]+)(\/.*|\?.*)?$/);
+  const url = req.url || '/';
+  const m = url.match(/^\/([a-z0-9-]+)(\/.*|\?.*)?$/);
   if (m) {
     const s = d.sites.find((x) => x.slug === m[1]);
     if (s) return { site: s, prefix: '/' + m[1], rest: m[2] || '' };
   }
+  // A page under /<slug>/ asked for an absolute path like /login or /assets/app.js.
+  // Work out which site it belongs to (from the Referer, else the last site visited)
+  // and redirect into that site's /<slug>/ path.
+  let site = null;
+  try {
+    const ref = new URL(req.headers.referer);
+    if (ref.host === req.headers.host) {
+      const rm = ref.pathname.match(/^\/([a-z0-9-]+)(\/|$)/);
+      if (rm) site = d.sites.find((x) => x.slug === rm[1]) || null;
+    }
+  } catch (_) { /* no/invalid referer */ }
+  if (!site && url !== '/') {
+    const c = cookieVal(req, 'pm_site');
+    if (c) site = d.sites.find((x) => x.slug === c) || null;
+  }
+  if (site) return { site, redirect: '/' + site.slug + url };
   return null;
 }
 
 function hostingHandler(req, res) {
   const r = resolve(req);
   if (!r) return notFound(res, 'No site is configured for this address.');
+  if (r.redirect) {
+    // 307 keeps the method and body, so form posts and fetch() calls still work
+    res.writeHead(307, { Location: r.redirect, 'Cache-Control': 'no-store' });
+    return res.end();
+  }
   if (r.prefix) {
     if (!r.rest || r.rest.startsWith('?')) {
       res.writeHead(301, { Location: r.prefix + '/' + (r.rest || '') });
       return res.end();
     }
+    req.originalUrl = req.url; // so static directory redirects keep the prefix
     req.url = r.rest;
+    req._pmPrefix = r.prefix;
     req.headers['x-forwarded-prefix'] = r.prefix;
+    res._pmCookie = `pm_site=${r.site.slug}; Path=/; SameSite=Lax; HttpOnly`;
   }
   serveSite(r.site, req, res);
 }
@@ -614,8 +722,13 @@ async function setEnabled(siteId, enabled) {
 
 function info(site) {
   const r = runtime.get(site.id) || {};
+  const tunnelHosts = [];
+  for (const t of db().tunnels || []) {
+    for (const r of t.routes || []) if (r.siteId === site.id) tunnelHosts.push({ hostname: r.hostname, tunnel: t.name, status: t.status });
+  }
   return {
     ...site,
+    tunnelHosts,
     webhookSecret: undefined,
     running: site.mode === 'node' ? !!r.proc : undefined,
     deploying: !!r.deploying,

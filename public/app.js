@@ -115,6 +115,7 @@
     { id: 'sites', label: 'Sites', icon: '🌐', perm: 'sites.view' },
     { id: 'files', label: 'Files', icon: '📁', perm: 'files.read' },
     { id: 'terminal', label: 'Terminal', icon: '⌨️', perm: 'terminal' },
+    { id: 'tunnels', label: 'Tunnels', icon: '☁️', perm: 'tunnels.manage' },
     { id: 'credentials', label: 'Git Credentials', icon: '🔑', perm: 'credentials.manage' },
     { id: 'users', label: 'Users', icon: '👥', perm: 'users.manage' },
     { id: 'settings', label: 'Settings', icon: '⚙️', perm: 'settings.manage' },
@@ -166,7 +167,7 @@
     $$('.nav a').forEach((a) => a.classList.toggle('active', a.dataset.page === page));
     const el = $('#page');
     el.innerHTML = '';
-    ({ sites: pageSites, files: pageFiles, terminal: pageTerminal, credentials: pageCredentials, users: pageUsers, settings: pageSettings, account: pageAccount })[page](el);
+    ({ sites: pageSites, files: pageFiles, terminal: pageTerminal, tunnels: pageTunnels, credentials: pageCredentials, users: pageUsers, settings: pageSettings, account: pageAccount })[page](el);
   }
 
   function passwordPrompt() {
@@ -196,24 +197,44 @@
   }
 
   // ------------------------------------------------------------------ sites
+  // Base address for /<slug>/ links: Settings > Sites URL, else this host on the
+  // published hosting port (no port shown when it is 80/443).
+  function sitesBase() {
+    const sys = state.system;
+    if (sys.sitesUrl) return sys.sitesUrl.replace(/\/+$/, '');
+    const port = sys.hostingPublicPort;
+    const proto = port === 443 ? 'https:' : 'http:';
+    const showPort = !(port === 80 || port === 443);
+    return `${proto}//${location.hostname}${showPort ? ':' + port : ''}`;
+  }
+
+  // Ordered best-first
   function siteUrls(s) {
-    const host = location.hostname;
     const urls = [];
-    for (const d of s.domains || []) urls.push({ label: 'Domain', url: `http://${d}/` });
+    for (const t of s.tunnelHosts || []) urls.push({ label: `Cloudflare tunnel "${t.tunnel}"`, url: `https://${t.hostname}/` });
+    for (const d of s.domains || []) urls.push({ label: 'Custom domain', url: `http://${d}/` });
     if (state.system.sitesBaseDomain) urls.push({ label: 'Subdomain', url: `http://${s.slug}.${state.system.sitesBaseDomain}/` });
-    if (s.port) urls.push({ label: 'Own port', url: `${location.protocol}//${host}:${s.port}/` });
-    urls.push({ label: 'Shared port', url: `${location.protocol}//${host}:${state.system.hostingPort}/${s.slug}/` });
+    urls.push({ label: 'Slug', url: `${sitesBase()}/${s.slug}/` });
+    if (s.port) urls.push({ label: 'Dedicated port', url: `${location.protocol}//${location.hostname}:${s.port}/` });
     return urls;
   }
 
+  // Preview uses the slug URL (works without any DNS)
+  function previewUrl(s) {
+    return `${sitesBase()}/${s.slug}/`;
+  }
+
   async function pageSites(el) {
+    const sys = state.system;
+    const portWarn = !sys.sitesUrl && !(sys.hostingPublicPort === 80 || sys.hostingPublicPort === 443);
     el.innerHTML = `
       <div class="page-head">
-        <div><h1>Sites</h1><p>Git repositories deployed as websites.</p></div>
+        <div><h1>Sites</h1><p>Git repositories deployed as websites. Each site lives at <code>${esc(sitesBase())}/&lt;slug&gt;/</code></p></div>
         ${can('sites.manage') ? '<button class="btn primary" id="add-site">+ Add site</button>' : ''}
       </div>
-      ${state.system.storage && !state.system.storage.ok ? `<div class="alert error"><b>Storage problem:</b> the /data volume can't run programs, so sites with install/build commands or App sites will fail (npm "Permission denied", exit code 126).<br>
-        ${esc(state.system.storage.problem)}<br><br>${esc(state.system.storage.fix)}</div>` : ''}
+      ${sys.storage && !sys.storage.ok ? `<div class="alert error"><b>Storage problem:</b> the /data volume can't run programs, so sites with install/build commands or App sites will fail (npm "Permission denied", exit code 126).<br>
+        ${esc(sys.storage.problem)}<br><br>${esc(sys.storage.fix)}</div>` : ''}
+      ${portWarn ? `<div class="alert warn">Site links currently include port ${sys.hostingPublicPort}. To get plain <code>http://server/&lt;slug&gt;/</code> links, publish the hosting port on host port <b>80</b> and set <code>HOSTING_PUBLIC_PORT=80</code>${can('settings.manage') ? ', or set <b>Settings → Sites URL</b> to the address your reverse proxy uses' : ''}.</div>` : ''}
       <div id="site-list" class="sites"><div class="muted">Loading…</div></div>`;
     if ($('#add-site')) $('#add-site').onclick = () => siteForm();
     const load = async () => {
@@ -224,16 +245,11 @@
     state.timer = setInterval(load, 4000);
   }
 
-  function renderSiteList(list) {
-    const box = $('#site-list');
-    if (!box) return;
-    if (!list.length) {
-      box.innerHTML = `<div class="card empty">No sites yet.${can('sites.manage') ? ' Click <b>+ Add site</b> to deploy a repository.' : ''}</div>`;
-      return;
-    }
-    box.innerHTML = list.map((s) => {
-      const status = s.deploying ? 'deploying' : (s.status || 'pending');
-      return `<div class="card site" data-id="${esc(s.id)}">
+  function siteInfoHtml(s) {
+    const status = s.deploying ? 'deploying' : (s.status || 'pending');
+    const urls = siteUrls(s);
+    const short = (u) => u.replace(/^https?:\/\//, '').replace(/\/$/, '');
+    return `
         <div class="site-head">
           <h3>${esc(s.name)}</h3>
           <span class="badge ${esc(status)}">${esc(status)}</span>
@@ -241,26 +257,93 @@
           ${s.autoPullMinutes ? `<span class="tag">auto-pull ${s.autoPullMinutes}m</span>` : ''}
         </div>
         <div class="site-meta">
+          <div><span class="k">Address</span><a href="${esc(urls[0].url)}" target="_blank" rel="noopener" class="site-main-url">${esc(short(urls[0].url))}</a></div>
+          ${urls.length > 1 ? `<div><span class="k">Also at</span>${urls.slice(1).map((u) => `<a class="tag" href="${esc(u.url)}" target="_blank" rel="noopener" title="${esc(u.label)}">${esc(short(u.url))}</a>`).join('')}</div>` : ''}
           <div><span class="k">Repo</span><span class="mono">${esc(s.repoUrl)}</span>${s.branch ? ` <span class="tag">${esc(s.branch)}</span>` : ''}</div>
           <div><span class="k">Commit</span>${esc(s.lastCommit || '—')} <span class="muted small">· ${fmtTime(s.lastDeploy)}</span></div>
-          <div><span class="k">URLs</span>${siteUrls(s).map((u) => `<a class="tag" href="${esc(u.url)}" target="_blank" rel="noopener" title="${esc(u.label)}">${esc(u.url)}</a>`).join('')}</div>
           ${s.lastError ? `<div class="err small">${esc(s.lastError)}</div>` : ''}
         </div>
         <div class="row site-actions">
+          <button class="btn sm" data-act="preview">👁 Preview</button>
           ${can('sites.deploy') ? `<button class="btn sm" data-act="deploy">⟳ Pull &amp; deploy</button>
             ${s.enabled === false ? '<button class="btn sm" data-act="start">▶ Start</button>' : '<button class="btn sm" data-act="stop">■ Stop</button>'}` : ''}
           <button class="btn sm" data-act="log">Logs</button>
           ${can('files.read') ? '<button class="btn sm" data-act="files">Files</button>' : ''}
           ${can('sites.manage') ? '<button class="btn sm" data-act="webhook">Webhook</button><button class="btn sm" data-act="edit">Edit</button><button class="btn sm danger" data-act="delete">Delete</button>' : ''}
-        </div>
-      </div>`;
-    }).join('');
+        </div>`;
+  }
+
+  // Preview thumbnail: the real page, scaled down. Only reloaded when the site is
+  // (re)deployed, started or stopped, never on the 4-second status refresh.
+  function previewKey(s) { return [previewUrl(s), s.lastDeploy, s.enabled, s.status === 'live'].join('|'); }
+  function thumbHtml(s) {
+    if (s.enabled === false) return '<div class="thumb-empty">Stopped</div>';
+    if (!s.lastDeploy) return '<div class="thumb-empty">Not deployed yet</div>';
+    return `<iframe src="${esc(previewUrl(s))}" loading="lazy" tabindex="-1" referrerpolicy="origin"
+      sandbox="allow-scripts allow-same-origin allow-forms" title="Preview of ${esc(s.name)}"></iframe>`;
+  }
+
+  function renderSiteList(list) {
+    const box = $('#site-list');
+    if (!box) return;
     box._sites = list;
-    $$('[data-act]', box).forEach((b) => {
-      b.onclick = () => {
-        const id = b.closest('.site').dataset.id;
-        siteAction(b.dataset.act, box._sites.find((x) => x.id === id));
-      };
+    if (!list.length) {
+      box.innerHTML = `<div class="card empty">No sites yet.${can('sites.manage') ? ' Click <b>+ Add site</b> to deploy a repository.' : ''}</div>`;
+      return;
+    }
+    if (!box.querySelector('.site')) box.innerHTML = '';
+    const seen = new Set();
+    list.forEach((s, i) => {
+      seen.add(s.id);
+      let card = box.querySelector(`.site[data-id="${CSS.escape(s.id)}"]`);
+      if (!card) {
+        card = document.createElement('div');
+        card.className = 'card site';
+        card.dataset.id = s.id;
+        card.innerHTML = '<div class="site-thumb" title="Open preview"></div><div class="site-info"></div>';
+        $('.site-thumb', card).onclick = () => siteAction('preview', box._sites.find((x) => x.id === s.id));
+      }
+      if (box.children[i] !== card) box.insertBefore(card, box.children[i] || null);
+      const key = previewKey(s);
+      if (card.dataset.pkey !== key) {
+        card.dataset.pkey = key;
+        $('.site-thumb', card).innerHTML = thumbHtml(s);
+      }
+      $('.site-info', card).innerHTML = siteInfoHtml(s);
+      $$('[data-act]', card).forEach((b) => {
+        b.onclick = () => siteAction(b.dataset.act, box._sites.find((x) => x.id === s.id));
+      });
+    });
+    $$('.site', box).forEach((c) => { if (!seen.has(c.dataset.id)) box.removeChild(c); });
+  }
+
+  function showPreview(s) {
+    const first = previewUrl(s);
+    const urls = [{ url: first }, ...siteUrls(s).filter((u) => u.url !== first)];
+    const sizes = { Desktop: '100%', Tablet: '820px', Phone: '390px' };
+    modal(`<div class="row preview-bar">
+        <h2 class="grow" style="margin:0">${esc(s.name)}</h2>
+        <select id="pv-url" style="width:auto;max-width:340px">${urls.map((u) => `<option value="${esc(u.url)}">${esc(u.url.replace(/^https?:\/\//, ''))}</option>`).join('')}</select>
+        <div class="seg">${Object.keys(sizes).map((k, i) => `<button class="btn sm ${i ? '' : 'on'}" data-size="${sizes[k]}">${k}</button>`).join('')}</div>
+        <button class="btn sm" id="pv-reload" title="Reload">⟳</button>
+        <a class="btn sm" id="pv-open" target="_blank" rel="noopener">Open ↗</a>
+        <button class="btn sm" data-close>Close</button>
+      </div>
+      <div class="preview-stage"><iframe id="pv-frame" referrerpolicy="origin" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"></iframe></div>
+      <p class="muted small" style="margin:8px 0 0">If the preview stays blank, the site may block embedding, or it is HTTP inside an HTTPS panel. Use <b>Open ↗</b>.</p>`, {
+      wide: true,
+      onMount: (m) => {
+        m.classList.add('preview-modal');
+        const frame = $('#pv-frame', m);
+        const setUrl = () => { frame.src = $('#pv-url', m).value; $('#pv-open', m).href = $('#pv-url', m).value; };
+        $('#pv-url', m).onchange = setUrl;
+        $('#pv-reload', m).onclick = () => { frame.src = frame.src; };
+        $$('[data-size]', m).forEach((b) => { b.onclick = () => {
+          $$('[data-size]', m).forEach((x) => x.classList.toggle('on', x === b));
+          frame.style.width = b.dataset.size;
+        }; });
+        setUrl();
+      },
     });
   }
 
@@ -271,6 +354,7 @@
       if (act === 'stop') { await api('POST', `/api/sites/${s.id}/stop`); toast('Site stopped'); }
       if (act === 'edit') siteForm(s);
       if (act === 'log') showLog(s);
+      if (act === 'preview') { showPreview(s); return; }
       if (act === 'files') { state.filesPath = '/' + s.slug; go('files'); return; }
       if (act === 'webhook') showWebhook(s);
       if (act === 'delete') {
@@ -329,7 +413,7 @@
         <div class="grid2">
           <label class="field"><span>Name</span><input type="text" name="name" value="${esc(s.name)}" required></label>
           <label class="field"><span>Slug</span><input type="text" name="slug" value="${esc(s.slug)}" placeholder="auto from name" pattern="[a-z0-9-]+">
-            <small>Folder name and path on the shared port (/<i>slug</i>/). Must be unique.</small></label>
+            <small>The site's address: <b>${esc(sitesBase())}/<i>slug</i>/</b>. Must be unique.</small></label>
         </div>
         <label class="field"><span>Repository URL</span><input type="text" name="repoUrl" value="${esc(s.repoUrl)}" required placeholder="https://github.com/user/repo.git  or  git@gitlab.com:user/repo.git">
           <small>Any git host: GitHub, GitLab, Bitbucket, Gitea/Forgejo, Azure DevOps, self-hosted… HTTPS uses tokens, SSH uses the deploy key.</small></label>
@@ -355,17 +439,17 @@
         </div>
         <label class="field" id="start-field"><span>Start command</span><input type="text" name="startCommand" value="${esc(s.startCommand)}" placeholder="e.g. node server.js  or  npm start">
           <small>Must listen on <code>$PORT</code> (assigned automatically, never shared with another site).</small></label>
-        <label class="field"><span>Custom domains</span><input type="text" name="domains" value="${esc((s.domains || []).join(', '))}" placeholder="www.example.com, example.com">
-          <small>Requests to the shared hosting port (${sys.hostingPort}) with these hostnames go to this site. Each domain can only belong to one site.${sys.sitesBaseDomain ? ` Also served at <b>${esc(s.slug || 'slug')}.${esc(sys.sitesBaseDomain)}</b>.` : ''}</small></label>
-        <div class="grid2">
-          <label class="field"><span>Dedicated port (optional)</span><input type="number" name="port" value="${esc(s.port || '')}" placeholder="range ${range}">
-            <small>Gives this site its own port. Range ${range}.${used.length ? ' In use: ' + used.join(', ') : ''}</small></label>
-          <label class="field"><span>Auto-pull every (minutes)</span><input type="number" name="autoPullMinutes" min="0" max="1440" value="${esc(s.autoPullMinutes || 0)}">
-            <small>0 = off. Redeploys only when there is a new commit.</small></label>
-        </div>
+        <label class="field"><span>Auto-pull every (minutes)</span><input type="number" name="autoPullMinutes" min="0" max="1440" value="${esc(s.autoPullMinutes || 0)}" style="max-width:160px">
+          <small>0 = off. Redeploys only when there is a new commit.</small></label>
         <label class="field"><span>Environment variables</span><textarea name="env" rows="3" placeholder="KEY=value (one per line)">${esc(s.env)}</textarea>
           <small>Available to install/build/start commands.</small></label>
         <label class="check"><input type="checkbox" name="spa" ${s.spa ? 'checked' : ''}> <span>Single-page app — serve <code>index.html</code> for unknown paths (React/Vue router etc.)</span></label>
+        <details class="adv" ${(s.domains || []).length || s.port ? 'open' : ''}><summary>Advanced: custom domains &amp; dedicated port</summary>
+          <label class="field"><span>Custom domains</span><input type="text" name="domains" value="${esc((s.domains || []).join(', '))}" placeholder="www.example.com, example.com">
+            <small>Hostnames you point at this server yourself (DNS / reverse proxy). For Cloudflare, use the <b>Tunnels</b> page instead. Each domain can only belong to one site.${sys.sitesBaseDomain ? ` Also served at <b>${esc(s.slug || 'slug')}.${esc(sys.sitesBaseDomain)}</b>.` : ''}</small></label>
+          <label class="field"><span>Dedicated port</span><input type="number" name="port" value="${esc(s.port || '')}" placeholder="optional, range ${range}" style="max-width:220px">
+            <small>Not needed normally. Only if something must reach this site on its own port. Range ${range}.${used.length ? ' In use: ' + used.join(', ') : ''}</small></label>
+        </details>
         <div id="site-err"></div>
         <div class="modal-foot"><button type="button" class="btn" data-close>Cancel</button><button class="btn primary">${editing ? 'Save &amp; redeploy' : 'Add &amp; deploy'}</button></div>
       </form>`, {
@@ -653,6 +737,214 @@
     });
   }
 
+  // ------------------------------------------------------------------ cloudflare tunnels
+  async function pageTunnels(el) {
+    el.innerHTML = `
+      <div class="page-head">
+        <div><h1>Cloudflare Tunnels</h1><p>Publish sites on your own domains through <b>your</b> Cloudflare account. No ports or port-forwarding needed.${state.user.isAdmin ? ' As an admin you see everyone\'s tunnels.' : ' Only you can see and change your tunnels.'}</p></div>
+        <button class="btn primary" id="add-tunnel">+ Connect Cloudflare</button>
+      </div>
+      <div id="tunnel-list"><div class="muted">Loading…</div></div>`;
+    $('#add-tunnel').onclick = () => tunnelForm();
+    const load = async () => {
+      if (state.page !== 'tunnels') return;
+      try { renderTunnels(await api('GET', '/api/tunnels')); } catch (_) {}
+    };
+    await load();
+    state.timer = setInterval(load, 5000);
+  }
+
+  function renderTunnels(list) {
+    const box = $('#tunnel-list');
+    if (!box) return;
+    if (!list.length) {
+      box.innerHTML = `<div class="card empty">No tunnels yet.<br><br>Click <b>+ Connect Cloudflare</b> and paste a Cloudflare API token. Pagemaster creates the tunnel and DNS records for you.</div>`;
+      return;
+    }
+    const badge = { connected: 'live', starting: 'deploying', error: 'error', stopped: 'stopped' };
+    box.innerHTML = list.map((t) => `
+      <div class="card" data-id="${esc(t.id)}">
+        <div class="site-head">
+          <h3>${esc(t.name)}</h3>
+          <span class="badge ${badge[t.status] || ''}">${esc(t.status)}</span>
+          <span class="tag">${t.mode === 'api' ? 'API managed' : 'Token'}</span>
+          ${t.accountName ? `<span class="tag">${esc(t.accountName)}</span>` : ''}
+          ${state.user.isAdmin && t.userId !== state.user.id ? `<span class="tag">owner: ${esc(t.owner)}</span>` : ''}
+        </div>
+        ${t.lastError ? `<div class="err small" style="margin-top:6px">${esc(t.lastError)}</div>` : ''}
+        <table style="margin-top:10px">
+          <thead><tr><th>Public address</th><th>Site</th><th></th></tr></thead>
+          <tbody>
+          ${t.routes.length ? t.routes.map((r) => `<tr data-rid="${esc(r.id)}">
+              <td><a href="https://${esc(r.hostname)}/" target="_blank" rel="noopener">https://${esc(r.hostname)}</a></td>
+              <td>${esc(r.siteName)}</td>
+              <td style="text-align:right"><button class="btn sm danger" data-a="unroute">Remove</button></td></tr>`).join('')
+            : '<tr><td colspan="3" class="muted">No public hostnames yet.</td></tr>'}
+          </tbody>
+        </table>
+        <div class="row site-actions">
+          <button class="btn sm primary" data-a="route">+ Publish a site</button>
+          ${t.enabled ? '<button class="btn sm" data-a="stop">■ Stop</button>' : '<button class="btn sm" data-a="start">▶ Start</button>'}
+          <button class="btn sm" data-a="log">Logs</button>
+          <button class="btn sm danger" data-a="delete">Delete tunnel</button>
+        </div>
+      </div>`).join('');
+    $$('#tunnel-list .card[data-id]').forEach((card) => {
+      const t = list.find((x) => x.id === card.dataset.id);
+      $$('[data-a]', card).forEach((b) => b.onclick = async () => {
+        try {
+          const a = b.dataset.a;
+          if (a === 'route') return routeForm(t);
+          if (a === 'log') return showTunnelLog(t);
+          if (a === 'start') await api('POST', `/api/tunnels/${t.id}/start`);
+          if (a === 'stop') await api('POST', `/api/tunnels/${t.id}/stop`);
+          if (a === 'unroute') {
+            const rid = b.closest('tr').dataset.rid;
+            const r = t.routes.find((x) => x.id === rid);
+            if (!(await confirmBox(`Stop publishing https://${r.hostname}?${t.mode === 'api' ? ' Its DNS record will be removed from Cloudflare.' : ''}`, 'Remove'))) return;
+            await api('DELETE', `/api/tunnels/${t.id}/routes/${rid}`);
+          }
+          if (a === 'delete') {
+            if (!(await confirmBox(`Delete tunnel "${t.name}"?${t.mode === 'api' ? ' The tunnel and the DNS records Pagemaster created will be removed from Cloudflare.' : ''}`))) return;
+            const r = await api('DELETE', `/api/tunnels/${t.id}`);
+            if (r.warnings && r.warnings.length) toast('Deleted, with warnings:\n' + r.warnings.join('\n'), 'error');
+          }
+          renderTunnels(await api('GET', '/api/tunnels'));
+        } catch (e) { toast(e.message, 'error'); }
+      });
+    });
+  }
+
+  function tunnelForm() {
+    modal(`<h2>Connect Cloudflare</h2>
+      <form id="tun-form">
+        <label class="field"><span>How do you want to connect?</span><select name="mode" id="tun-mode">
+          <option value="api">API token: Pagemaster creates the tunnel and DNS for you (recommended)</option>
+          <option value="token">Tunnel token: I already made a tunnel in the Zero Trust dashboard</option>
+        </select></label>
+        <label class="field"><span>Name</span><input type="text" name="name" required placeholder="e.g. My domains" maxlength="60"></label>
+        <div id="tun-api">
+          <div class="alert info small">Create a token at <b>dash.cloudflare.com → My Profile → API Tokens → Create Custom Token</b> with:<br>
+            • Account → <b>Cloudflare Tunnel</b> → Edit<br>• Zone → <b>DNS</b> → Edit<br>• Zone → <b>Zone</b> → Read<br>
+            Zone resources: the domains you want to use. The token is stored encrypted and only used for your tunnels.</div>
+          <label class="field"><span>Cloudflare API token</span>
+            <div class="row"><input type="password" name="apiToken" class="grow" style="width:auto" autocomplete="off"><button type="button" class="btn" id="tun-check">Check token</button></div></label>
+          <label class="field"><span>Account</span><select name="accountId" id="tun-acct" disabled><option value="">Check the token first</option></select></label>
+        </div>
+        <div id="tun-token" style="display:none">
+          <div class="alert info small">In Zero Trust → Networks → Tunnels, create a <b>Cloudflared</b> tunnel and copy the token from the install command.
+            Then add public hostnames there with service <code>HTTP</code> → <code>localhost:${state.system.hostingPort}</code>, and register the same hostnames here with <b>+ Publish a site</b>.</div>
+          <label class="field"><span>Tunnel token</span><textarea name="token" rows="3" placeholder="eyJhIjoi... (or paste the whole 'cloudflared ... --token ...' command)"></textarea></label>
+        </div>
+        <div class="modal-foot"><button type="button" class="btn" data-close>Cancel</button><button class="btn primary" id="tun-save">Create tunnel</button></div>
+      </form>`, {
+      onMount: (m, close) => {
+        const mode = $('#tun-mode', m);
+        const sync = () => {
+          $('#tun-api', m).style.display = mode.value === 'api' ? '' : 'none';
+          $('#tun-token', m).style.display = mode.value === 'token' ? '' : 'none';
+        };
+        mode.onchange = sync;
+        sync();
+        $('#tun-check', m).onclick = async () => {
+          const btn = $('#tun-check', m);
+          btn.disabled = true;
+          try {
+            const r = await api('POST', '/api/cloudflare/inspect', { apiToken: $('[name=apiToken]', m).value });
+            const sel = $('#tun-acct', m);
+            sel.innerHTML = r.accounts.map((a) => `<option value="${esc(a.id)}">${esc(a.name)}</option>`).join('');
+            sel.disabled = false;
+            toast(`Token OK: ${r.accounts.length} account(s)`, 'ok');
+          } catch (e) { toast(e.message, 'error'); } finally { btn.disabled = false; }
+        };
+        $('#tun-form', m).onsubmit = async (e) => {
+          e.preventDefault();
+          const btn = $('#tun-save', m);
+          btn.disabled = true;
+          btn.textContent = 'Creating…';
+          try {
+            await api('POST', '/api/tunnels', formData(e.target));
+            toast('Tunnel created, starting cloudflared…', 'ok');
+            close();
+            renderTunnels(await api('GET', '/api/tunnels'));
+          } catch (ex) { toast(ex.message, 'error'); } finally { btn.disabled = false; btn.textContent = 'Create tunnel'; }
+        };
+      },
+    });
+  }
+
+  async function routeForm(t) {
+    let sites = [];
+    let zones = [];
+    try {
+      sites = await api('GET', '/api/tunnels/sites');
+      if (t.mode === 'api') zones = await api('GET', `/api/tunnels/${t.id}/zones`);
+    } catch (e) { return toast(e.message, 'error'); }
+    if (!sites.length) return toast('Add a site first', 'error');
+    if (t.mode === 'api' && !zones.length) return toast('This API token cannot see any domains. Give it Zone → Zone → Read and DNS → Edit for your domain.', 'error');
+    modal(`<h2>Publish a site through "${esc(t.name)}"</h2>
+      <form id="route-form">
+        <label class="field"><span>Site</span><select name="siteId" id="rt-site">${sites.map((s) => `<option value="${esc(s.id)}" data-slug="${esc(s.slug)}">${esc(s.name)} (/${esc(s.slug)}/)</option>`).join('')}</select></label>
+        ${t.mode === 'api' ? `
+        <div class="grid2">
+          <label class="field"><span>Subdomain</span><input type="text" name="subdomain" id="rt-sub" placeholder="blank = the domain itself"></label>
+          <label class="field"><span>Domain</span><select name="zoneId" id="rt-zone">${zones.map((z) => `<option value="${esc(z.id)}" data-name="${esc(z.name)}">${esc(z.name)}</option>`).join('')}</select></label>
+        </div>` : `
+        <label class="field"><span>Hostname</span><input type="text" name="hostname" id="rt-host" required placeholder="blog.example.com">
+          <small>Must match a public hostname you added to this tunnel in the Cloudflare dashboard (service <code>http://localhost:${state.system.hostingPort}</code>).</small></label>`}
+        <p>Address: <b id="rt-preview" class="mono"></b></p>
+        <div class="modal-foot"><button type="button" class="btn" data-close>Cancel</button><button class="btn primary" id="rt-save">Publish</button></div>
+      </form>`, {
+      onMount: (m, close) => {
+        const sub = $('#rt-sub', m);
+        const prev = () => {
+          let h = '';
+          if (t.mode === 'api') {
+            const zn = $('#rt-zone', m).selectedOptions[0].dataset.name;
+            h = sub.value.trim() ? `${sub.value.trim().toLowerCase()}.${zn}` : zn;
+          } else h = $('#rt-host', m).value.trim().toLowerCase();
+          $('#rt-preview', m).textContent = h ? `https://${h}` : '';
+        };
+        if (sub) {
+          // default subdomain = the site's slug
+          const setDefault = () => { sub.value = $('#rt-site', m).selectedOptions[0].dataset.slug; prev(); };
+          $('#rt-site', m).onchange = setDefault;
+          $('#rt-zone', m).onchange = prev;
+          sub.oninput = prev;
+          setDefault();
+        } else {
+          $('#rt-host', m).oninput = prev;
+        }
+        $('#route-form', m).onsubmit = async (e) => {
+          e.preventDefault();
+          const btn = $('#rt-save', m);
+          btn.disabled = true;
+          try {
+            await api('POST', `/api/tunnels/${t.id}/routes`, formData(e.target));
+            toast(`Published ${$('#rt-preview', m).textContent}. DNS can take a minute.`, 'ok');
+            close();
+            renderTunnels(await api('GET', '/api/tunnels'));
+          } catch (ex) { toast(ex.message, 'error'); } finally { btn.disabled = false; }
+        };
+      },
+    });
+  }
+
+  function showTunnelLog(t) {
+    const m = modal(`<div class="row"><h2 class="grow" style="margin:0">cloudflared — ${esc(t.name)}</h2><button class="btn sm" data-close>Close</button></div>
+      <pre class="logbox mono" id="tlog" style="margin-top:12px">Loading…</pre>`, { wide: true });
+    const load = async () => {
+      if (!document.body.contains(m.el)) return clearInterval(timer);
+      try {
+        const box = $('#tlog', m.el);
+        box.textContent = (await api('GET', `/api/tunnels/${t.id}/log`)) || '(no output yet)';
+        box.scrollTop = box.scrollHeight;
+      } catch (_) {}
+    };
+    const timer = setInterval(load, 3000);
+    load();
+  }
+
   // ------------------------------------------------------------------ users
   async function pageUsers(el) {
     el.innerHTML = `
@@ -735,6 +1027,8 @@
         <h2>General</h2>
         <label class="field"><span>Public URL of this admin panel</span><input type="text" name="publicUrl" value="${esc(s.publicUrl)}" placeholder="https://pagemaster.example.com">
           <small>Used for SSO redirects and webhook URLs. Leave blank to use the address in your browser.</small></label>
+        <label class="field"><span>Sites URL</span><input type="text" name="sitesUrl" value="${esc(s.sitesUrl)}" placeholder="e.g. http://192.168.1.50 or https://sites.example.com">
+          <small>The address people use to reach your sites. Each site is shown as <code>&lt;Sites URL&gt;/&lt;slug&gt;/</code>. Leave blank to use this server's address${state.system.hostingPublicPort === 80 ? '' : ` with port ${state.system.hostingPublicPort}`}.</small></label>
         <label class="field"><span>Sites base domain</span><input type="text" name="sitesBaseDomain" value="${esc(s.sitesBaseDomain)}" placeholder="sites.example.com">
           <small>Optional. Every site is also served at <code>&lt;slug&gt;.&lt;base domain&gt;</code> on the shared hosting port (${state.system.hostingPort}) — point a wildcard DNS record / reverse proxy at it.</small></label>
       </div>
@@ -765,6 +1059,7 @@
       const f = formData(e.target);
       const body = {
         publicUrl: f.publicUrl,
+        sitesUrl: f.sitesUrl,
         sitesBaseDomain: f.sitesBaseDomain,
         sso: {
           enabled: f.sso_enabled, label: f.sso_label, scopes: f.sso_scopes, issuer: f.sso_issuer,

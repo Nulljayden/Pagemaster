@@ -16,12 +16,14 @@ const PERMISSIONS = {
   'files.read': 'Browse and download files',
   'files.write': 'Upload, edit, rename and delete files',
   'terminal': 'Use the built-in shell (full container access)',
+  'tunnels.manage': 'Connect your own Cloudflare account and publish sites through your tunnels',
   'users.manage': 'Manage users and permissions',
   'settings.manage': 'Change SSO and system settings',
 };
 
 const DEFAULT_SETTINGS = {
   publicUrl: '',
+  sitesUrl: '',
   sitesBaseDomain: '',
   sso: {
     enabled: false,
@@ -80,6 +82,7 @@ function load() {
   state.sessions = state.sessions || [];
   state.sites = state.sites || [];
   state.credentials = state.credentials || [];
+  state.tunnels = state.tunnels || [];
   state.settings = Object.assign({}, DEFAULT_SETTINGS, state.settings || {});
   state.settings.sso = Object.assign({}, DEFAULT_SETTINGS.sso, state.settings.sso || {});
 

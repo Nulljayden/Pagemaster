@@ -19,6 +19,11 @@ module.exports = {
   ADMIN_PORT: parseInt(process.env.ADMIN_PORT || '8080', 10),
   // Shared hosting port (routes by hostname or /<slug>/ path)
   HOSTING_PORT: parseInt(process.env.HOSTING_PORT || '8081', 10),
+  // Port the hosting port is published on outside the container (80 = no port in URLs)
+  HOSTING_PUBLIC_PORT: parseInt(process.env.HOSTING_PUBLIC_PORT || process.env.HOSTING_PORT || '8081', 10),
+  // Cloudflare tunnels
+  CLOUDFLARED_BIN: process.env.CLOUDFLARED_BIN || 'cloudflared',
+  CF_API_BASE: process.env.CF_API_BASE || 'https://api.cloudflare.com/client/v4',
   // Ports a site may claim as its own dedicated port (must be published in Docker)
   SITE_PORT_RANGE: parseRange(process.env.SITE_PORT_RANGE || '8100-8199'),
   // Internal loopback ports used by "node app" sites behind the proxy
