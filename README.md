@@ -65,11 +65,18 @@ services:
       - "38080:38080"
       - "38081:38081"
     volumes:
-      - /mnt/tank/apps/pagemaster:/data
+      - /mnt/tank/apps/pagemaster:/data        # settings, users, tokens, logs
+      - pagemaster-sites:/data/sites           # cloned sites + node_modules
+volumes:
+  pagemaster-sites:
 ```
+
+   The second volume keeps the site files (and `node_modules`) on a Docker volume, which always allows running programs. A TrueNAS dataset with the SMB preset or `exec=off` would otherwise break `npm ci` with "Permission denied" (exit code 126). See [Storage requirements](#storage-requirements-important-on-truenas). You can still browse and edit the files with the built-in **Files** page.
 
 4. Open `http://TRUENAS-IP:38080` and sign in with `admin` / `admin`.
 
+> **Updating:** TrueNAS does not re-download `:latest` when you redeploy. To update, open **System → Shell** and run `docker pull ghcr.io/nulljayden/pagemaster:latest`, then stop and start the app. Or pin a version in the YAML, e.g. `image: ghcr.io/nulljayden/pagemaster:sha-5e8c8bc`, and change it to update. Every build is tagged `sha-<commit>`.
+>
 > Ports 38080/38081 don't clash with the TrueNAS UI or common apps. To use different ones, change **both** the env var and the mapping (e.g. `ADMIN_PORT=40080` with `"40080:40080"`). Tunnels follow `HOSTING_PORT` automatically.
 
 ### Proxmox VE

@@ -296,6 +296,7 @@ async function deploy(siteId, opts = {}) {
   const r = rt(siteId);
   if (r.deploying) { r.queued = true; return { queued: true }; }
   r.deploying = true;
+  let stage = 'fetch';
   try {
     let site = db().sites.find((s) => s.id === siteId);
     if (!site) return;
@@ -307,6 +308,7 @@ async function deploy(siteId, opts = {}) {
     if (!changed && opts.onlyIfChanged) { setStatus(site, site.status, { lastCheck: Date.now() }); return; }
 
     setStatus(site, 'deploying');
+    stage = 'build';
     if (site.installCommand || site.buildCommand || site.mode === 'node') {
       const chk = checkStorage();
       if (!chk.ok) throw new Error(`Storage problem in ${config.SITES_DIR}: ${chk.problem}\n${STORAGE_FIX}`);
@@ -320,12 +322,18 @@ async function deploy(siteId, opts = {}) {
     if (site.mode === 'node' && site.enabled !== false) await startApp(site);
     const commit = (await run(site, 'git', ['log', '-1', '--format=%h %s'], { cwd: dir, env })).trim();
     log(site, `Deploy finished: ${commit}`);
-    setStatus(site, site.enabled === false ? 'stopped' : 'live', { lastDeploy: Date.now(), lastCommit: commit, lastError: '', lastCheck: Date.now() });
+    setStatus(site, site.enabled === false ? 'stopped' : 'live', { lastDeploy: Date.now(), lastCommit: commit, lastError: '', lastCheck: Date.now(), buildOk: true });
   } catch (e) {
     const site = db().sites.find((s) => s.id === siteId);
     if (site) {
       log(site, `ERROR: ${e.message}`);
-      setStatus(site, 'error', { lastError: e.message, lastCheck: Date.now() });
+      // A failed install/build can leave node_modules half-deleted: don't run the app on it
+      const extra = { lastError: e.message, lastCheck: Date.now() };
+      if (stage === 'build') {
+        extra.buildOk = false;
+        if (site.mode === 'node') await stopApp(siteId);
+      }
+      setStatus(site, 'error', extra);
     }
   } finally {
     r.deploying = false;
@@ -379,7 +387,11 @@ async function startApp(site) {
   r.proc = p;
   r.stopping = false;
   const started = Date.now();
-  const onData = (b) => { try { fs.appendFileSync(logFile(s), b); } catch (_) {} };
+  r.tail = '';
+  const onData = (b) => {
+    try { fs.appendFileSync(logFile(s), b); } catch (_) {}
+    r.tail = (r.tail + b.toString()).slice(-4000);
+  };
   p.stdout.on('data', onData);
   p.stderr.on('data', onData);
   p.on('error', (e) => log(s, `App error: ${e.message}`));
@@ -391,8 +403,17 @@ async function startApp(site) {
     if (r.stopping || cur.enabled === false) return;
     if (Date.now() - started > 60000) r.restarts = 0;
     r.restarts = (r.restarts || 0) + 1;
+    let hint = '';
+    if (/Cannot find module|MODULE_NOT_FOUND/.test(r.tail)) hint = ' Dependencies are missing: set the install command (e.g. "npm ci"), make sure it succeeds, then redeploy.';
+    else if (/EADDRINUSE/.test(r.tail)) hint = ' The app must listen on the PORT environment variable.';
+    if (r.restarts >= 5) {
+      log(cur, `App crashed ${r.restarts} times in a row; not restarting again.${hint}`);
+      setStatus(cur, 'error', { lastError: `App keeps crashing (exit code ${code}); stopped retrying. Check the logs, fix it, then Start or redeploy.${hint}` });
+      r.restarts = 0;
+      return;
+    }
     const delay = Math.min(60, 2 ** r.restarts);
-    setStatus(cur, 'error', { lastError: `App crashed (code ${code}), restarting in ${delay}s` });
+    setStatus(cur, 'error', { lastError: `App crashed (code ${code}), restarting in ${delay}s.${hint}` });
     r.restartTimer = setTimeout(() => {
       const again = db().sites.find((x) => x.id === s.id);
       if (again && again.enabled !== false && !r.proc) startApp(again).then(() => setStatus(again, 'live', { lastError: '' })).catch(() => {});
@@ -678,6 +699,7 @@ async function update(siteId, input) {
   }
   if (repoChanged) fs.rmSync(newDir, { recursive: true, force: true }); // fresh clone
   rt(site.id).handler = null;
+  site.buildOk = false;
   save();
   await syncDedicatedServers();
   deploy(site.id);
@@ -698,6 +720,11 @@ async function remove(siteId) {
   runtime.delete(siteId);
 }
 
+// Has this site had a successful install/build since its last change?
+function buildReady(site) {
+  return site.buildOk === true || (site.buildOk === undefined && !!site.lastDeploy);
+}
+
 async function setEnabled(siteId, enabled) {
   const site = db().sites.find((s) => s.id === siteId);
   if (!site) throw Object.assign(new Error('Site not found'), { status: 404 });
@@ -709,7 +736,10 @@ async function setEnabled(siteId, enabled) {
     setStatus(site, 'stopped');
   } else {
     log(site, 'Site started');
-    if (site.mode === 'node' && fs.existsSync(publishDir(site))) {
+    if (site.mode === 'node' && !buildReady(site)) {
+      log(site, 'Last install/build did not succeed, so deploying before starting');
+      deploy(siteId);
+    } else if (site.mode === 'node' && fs.existsSync(publishDir(site))) {
       await startApp(site);
       setStatus(site, 'live', { lastError: '' });
     } else if (fs.existsSync(publishDir(site))) {
@@ -743,7 +773,9 @@ async function startAll() {
   for (const s of d.sites) {
     if (s.enabled === false) continue;
     if (!fs.existsSync(path.join(repoDir(s), '.git'))) { deploy(s.id); continue; }
-    if (s.mode === 'node') {
+    if (s.mode === 'node' && !buildReady(s)) {
+      deploy(s.id);
+    } else if (s.mode === 'node') {
       startApp(s).then(() => setStatus(s, 'live')).catch((e) => setStatus(s, 'error', { lastError: e.message }));
     } else if (s.status === 'deploying' || s.status === 'pending') {
       deploy(s.id);
