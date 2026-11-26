@@ -15,6 +15,11 @@ const terminal = require('./terminal');
 const cloudflare = require('./cloudflare');
 
 const { db, save, id, encrypt, PERMISSIONS } = store;
+
+// Build id of this image (set by CI). Used to version the UI's script/style URLs so
+// browsers and Cloudflare never serve an old app.js after an update.
+const BUILD = (process.env.PAGEMASTER_BUILD || 'dev').slice(0, 7);
+const ASSET_VERSION = BUILD === 'dev' ? Date.now().toString(36) : BUILD;
 store.load();
 auth.ensureDefaultAdmin();
 
@@ -45,6 +50,7 @@ app.post('/hooks/:id/:secret', (req, res) => {
 
 // ------------------------------------------------------------------ auth
 sso.register(app);
+app.use('/api', (_req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
 app.use('/api', auth.csrfGuard);
 
 app.get('/api/public', (_req, res) => {
@@ -106,7 +112,7 @@ app.get('/api/system', auth.requireAuth, (_req, res) => {
     sitesBaseDomain: d.settings.sitesBaseDomain || '',
     storage: { ...sites.getStorageCheck(), fix: sites.STORAGE_FIX },
     version: require('../package.json').version,
-    build: (process.env.PAGEMASTER_BUILD || 'dev').slice(0, 7),
+    build: BUILD,
   });
 });
 
@@ -387,9 +393,16 @@ app.get('/api/tunnels/:id/log', T, (req, res) => res.type('text/plain').send(clo
 app.use('/api/files', files.router());
 
 // ------------------------------------------------------------------ static UI
-app.use('/vendor/xterm', express.static(path.join(path.dirname(require.resolve('@xterm/xterm/package.json')))));
-app.use('/vendor/xterm-fit', express.static(path.join(path.dirname(require.resolve('@xterm/addon-fit/package.json')))));
-app.use(express.static(path.join(__dirname, '..', 'public')));
+// The page itself is never cached; it points at versioned asset URLs (?v=<build>).
+const INDEX_HTML = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8').replace(/__V__/g, ASSET_VERSION);
+app.get(['/', '/index.html'], (_req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.type('html').send(INDEX_HTML);
+});
+const assetHeaders = { setHeaders: (res) => res.set('Cache-Control', 'no-cache') };
+app.use('/vendor/xterm', express.static(path.join(path.dirname(require.resolve('@xterm/xterm/package.json'))), assetHeaders));
+app.use('/vendor/xterm-fit', express.static(path.join(path.dirname(require.resolve('@xterm/addon-fit/package.json'))), assetHeaders));
+app.use(express.static(path.join(__dirname, '..', 'public'), { ...assetHeaders, index: false }));
 app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found' }));
 
 // eslint-disable-next-line no-unused-vars
