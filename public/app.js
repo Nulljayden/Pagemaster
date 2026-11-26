@@ -777,7 +777,8 @@
           <thead><tr><th>Public address</th><th>Site</th><th></th></tr></thead>
           <tbody>
           ${t.routes.length ? t.routes.map((r) => `<tr data-rid="${esc(r.id)}">
-              <td><a href="https://${esc(r.hostname)}/" target="_blank" rel="noopener">https://${esc(r.hostname)}</a></td>
+              <td><a href="https://${esc(r.hostname)}/" target="_blank" rel="noopener">https://${esc(r.hostname)}</a>
+                ${r.dnsManual ? ' <button class="btn sm" data-a="dns" title="Pagemaster could not create the DNS record">⚠ DNS record needed</button>' : ''}</td>
               <td>${esc(r.siteName)}</td>
               <td style="text-align:right"><button class="btn sm danger" data-a="unroute">Remove</button></td></tr>`).join('')
             : '<tr><td colspan="3" class="muted">No public hostnames yet.</td></tr>'}
@@ -787,6 +788,7 @@
           <button class="btn sm primary" data-a="route">+ Publish a site</button>
           ${t.enabled ? '<button class="btn sm" data-a="stop">■ Stop</button>' : '<button class="btn sm" data-a="start">▶ Start</button>'}
           <button class="btn sm" data-a="log">Logs</button>
+          ${t.mode === 'api' ? '<button class="btn sm" data-a="token">Update API token</button>' : ''}
           <button class="btn sm danger" data-a="delete">Delete tunnel</button>
         </div>
       </div>`).join('');
@@ -797,6 +799,12 @@
           const a = b.dataset.a;
           if (a === 'route') return routeForm(t);
           if (a === 'log') return showTunnelLog(t);
+          if (a === 'token') return updateTokenForm(t);
+          if (a === 'dns') {
+            const r = t.routes.find((x) => x.id === b.closest('tr').dataset.rid);
+            return manualDnsModal(`Pagemaster could not create the DNS record for ${r.hostname} because the API token lacks DNS permission.`,
+              { type: 'CNAME', name: r.hostname, target: r.dnsTarget, proxied: true });
+          }
           if (a === 'start') await api('POST', `/api/tunnels/${t.id}/start`);
           if (a === 'stop') await api('POST', `/api/tunnels/${t.id}/stop`);
           if (a === 'unroute') {
@@ -825,9 +833,7 @@
         </select></label>
         <label class="field"><span>Name</span><input type="text" name="name" required placeholder="e.g. My domains" maxlength="60"></label>
         <div id="tun-api">
-          <div class="alert info small">Create a token at <b>dash.cloudflare.com → My Profile → API Tokens → Create Custom Token</b> with:<br>
-            • Account → <b>Cloudflare Tunnel</b> → Edit<br>• Zone → <b>DNS</b> → Edit<br>• Zone → <b>Zone</b> → Read<br>
-            Zone resources: the domains you want to use. The token is stored encrypted and only used for your tunnels.</div>
+          <div class="alert info small">${TOKEN_HELP}</div>
           <label class="field"><span>Cloudflare API token</span>
             <div class="row"><input type="password" name="apiToken" class="grow" style="width:auto" autocomplete="off"><button type="button" class="btn" id="tun-check">Check token</button></div></label>
           <label class="field"><span>Account</span><select name="accountId" id="tun-acct" disabled><option value="">Check the token first</option></select></label>
@@ -922,11 +928,59 @@
           const btn = $('#rt-save', m);
           btn.disabled = true;
           try {
-            await api('POST', `/api/tunnels/${t.id}/routes`, formData(e.target));
-            toast(`Published ${$('#rt-preview', m).textContent}. DNS can take a minute.`, 'ok');
+            const r = await api('POST', `/api/tunnels/${t.id}/routes`, formData(e.target));
             close();
+            if (r.warning) manualDnsModal(r.warning.message, r.warning.record);
+            else toast(`Published ${$('#rt-preview', m).textContent}. DNS can take a minute.`, 'ok');
             if (state.page === 'tunnels') renderTunnels(await api('GET', '/api/tunnels'));
             if (state.page === 'sites') renderSiteList(await api('GET', '/api/sites'));
+          } catch (ex) { toast(ex.message, 'error'); } finally { btn.disabled = false; }
+        };
+      },
+    });
+  }
+
+  const TOKEN_HELP = `Create it at <b>dash.cloudflare.com → My Profile → API Tokens → Create Token → Custom token</b>, and add <b>all three</b> permission rows:<br>
+    • <b>Account</b> · Cloudflare Tunnel · Edit<br>
+    • <b>Zone</b> · DNS · Edit<br>
+    • <b>Zone</b> · Zone · Read<br>
+    Under <b>Zone Resources</b> pick <i>Include → All zones</i> (or your domain). DNS is a <b>Zone</b> permission. Account-level "all permissions" does not include it.
+    The token is stored encrypted and only used for your tunnels.`;
+
+  function manualDnsModal(message, rec) {
+    modal(`<h2>One DNS record to add</h2>
+      <div class="alert warn">${esc(message)}</div>
+      <p>Either add this record in <b>Cloudflare → your domain → DNS → Records → Add record</b>:</p>
+      <table><tbody>
+        <tr><th>Type</th><td class="mono">${esc(rec.type)}</td></tr>
+        <tr><th>Name</th><td class="mono">${esc(rec.name)}</td></tr>
+        <tr><th>Target</th><td class="mono">${esc(rec.target)} <button class="btn sm" id="cp-target">Copy</button></td></tr>
+        <tr><th>Proxy status</th><td>Proxied (orange cloud)</td></tr>
+      </tbody></table>
+      <p>…or give the API token <b>Zone · DNS · Edit</b> and use <b>Update API token</b> on the Tunnels page. Pagemaster will then create the record itself.</p>
+      <div class="modal-foot"><button class="btn primary" data-close>OK</button></div>`, {
+      onMount: (m) => { $('#cp-target', m).onclick = () => navigator.clipboard.writeText(rec.target).then(() => toast('Copied', 'ok')); },
+    });
+  }
+
+  function updateTokenForm(t) {
+    modal(`<h2>Update API token: ${esc(t.name)}</h2>
+      <div class="alert info small">${TOKEN_HELP}</div>
+      <form id="tok-form">
+        <label class="field"><span>New Cloudflare API token</span><input type="password" name="apiToken" required autocomplete="off"></label>
+        <div class="modal-foot"><button type="button" class="btn" data-close>Cancel</button><button class="btn primary" id="tok-save">Save &amp; retry</button></div>
+      </form>`, {
+      onMount: (m, close) => {
+        $('#tok-form', m).onsubmit = async (e) => {
+          e.preventDefault();
+          const btn = $('#tok-save', m);
+          btn.disabled = true;
+          try {
+            const r = await api('PUT', `/api/tunnels/${t.id}/token`, formData(e.target));
+            close();
+            if (r.warnings && r.warnings.length) toast('Token saved, but:\n' + r.warnings.join('\n'), 'error');
+            else toast('Token saved. Everything is set up.', 'ok');
+            if (state.page === 'tunnels') renderTunnels(await api('GET', '/api/tunnels'));
           } catch (ex) { toast(ex.message, 'error'); } finally { btn.disabled = false; }
         };
       },

@@ -385,6 +385,7 @@ app.get('/api/tunnels/:id/zones', T, wrap(async (req, res) => {
   if (t.mode !== 'api') return res.json([]);
   res.json(await cloudflare.listZones(t));
 }));
+app.put('/api/tunnels/:id/token', T, json, wrap(async (req, res) => res.json(await cloudflare.updateToken(req.user, req.params.id, req.body.apiToken))));
 app.post('/api/tunnels/:id/routes', T, json, wrap(async (req, res) => res.json(await cloudflare.addRoute(req.user, req.params.id, req.body))));
 app.delete('/api/tunnels/:id/routes/:rid', T, wrap(async (req, res) => res.json(await cloudflare.removeRoute(req.user, req.params.id, req.params.rid))));
 app.get('/api/tunnels/:id/log', T, (req, res) => res.type('text/plain').send(cloudflare.readLog(req.user, req.params.id)));

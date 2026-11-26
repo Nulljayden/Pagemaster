@@ -19,7 +19,16 @@ const SUB_RE = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.[a-z0-9](?:[a-z0-9
 function httpError(status, msg) { return Object.assign(new Error(msg), { status }); }
 
 // ---------------------------------------------------------------- Cloudflare API
-async function cf(token, method, p, body) {
+// What each kind of call needs, so errors can say exactly which permission is missing
+const STEP = {
+  accounts: { what: 'list your accounts', perm: 'any Account permission (e.g. Account → Cloudflare Tunnel → Edit)' },
+  zones: { what: 'list your domains', perm: 'Zone → Zone → Read' },
+  dns: { what: 'manage DNS records', perm: 'Zone → DNS → Edit (with this domain included under Zone Resources)' },
+  tunnel: { what: 'manage the tunnel', perm: 'Account → Cloudflare Tunnel → Edit' },
+};
+const AUTH_CODES = new Set([10000, 9109, 9103, 10001, 7003]);
+
+async function cf(token, method, p, body, step) {
   let res;
   try {
     res = await fetch(config.CF_API_BASE + p, {
@@ -33,17 +42,25 @@ async function cf(token, method, p, body) {
   let data;
   try { data = await res.json(); } catch (_) { throw httpError(502, `Cloudflare API returned HTTP ${res.status}`); }
   if (!data.success) {
-    const msg = (data.errors || []).map((e) => `${e.message} (${e.code})`).join('; ') || `HTTP ${res.status}`;
-    throw httpError(res.status === 403 || res.status === 401 ? 400 : 502, `Cloudflare: ${msg}`);
+    const errs = data.errors || [];
+    const msg = errs.map((e) => `${e.message} (${e.code})`).join('; ') || `HTTP ${res.status}`;
+    const auth = res.status === 401 || res.status === 403 || errs.some((e) => AUTH_CODES.has(e.code));
+    const st = STEP[step];
+    const text = auth && st
+      ? `Cloudflare refused to ${st.what}: ${msg}. The API token needs: ${st.perm}.`
+      : `Cloudflare${st ? ` (${st.what})` : ''}: ${msg}`;
+    const err = httpError(auth ? 400 : 502, text);
+    err.cfAuth = auth;
+    throw err;
   }
   return data;
 }
 
-async function cfAll(token, p) {
+async function cfAll(token, p, step) {
   const out = [];
   for (let page = 1; page <= 20; page++) {
     const sep = p.includes('?') ? '&' : '?';
-    const data = await cf(token, 'GET', `${p}${sep}page=${page}&per_page=50`);
+    const data = await cf(token, 'GET', `${p}${sep}page=${page}&per_page=50`, undefined, step);
     out.push(...(data.result || []));
     const info = data.result_info;
     if (!info || !info.total_pages || page >= info.total_pages) break;
@@ -54,14 +71,14 @@ async function cfAll(token, p) {
 // Look at what an API token can reach (used by the "add tunnel" form)
 async function inspectToken(apiToken) {
   if (!apiToken) throw httpError(400, 'API token is required');
-  const accounts = await cfAll(apiToken, '/accounts');
+  const accounts = await cfAll(apiToken, '/accounts', 'accounts');
   if (!accounts.length) throw httpError(400, 'This token cannot see any Cloudflare account. Give it "Account - Cloudflare Tunnel - Edit".');
   return { accounts: accounts.map((a) => ({ id: a.id, name: a.name })) };
 }
 
 async function listZones(t) {
   const token = decrypt(t.apiToken);
-  const zones = await cfAll(token, `/zones?account.id=${encodeURIComponent(t.accountId)}`);
+  const zones = await cfAll(token, `/zones?account.id=${encodeURIComponent(t.accountId)}`, 'zones');
   return zones.map((z) => ({ id: z.id, name: z.name, status: z.status }));
 }
 
@@ -82,7 +99,7 @@ function ingressFor(t) {
 
 async function pushIngress(t) {
   if (t.mode !== 'api') return;
-  await cf(decrypt(t.apiToken), 'PUT', `/accounts/${t.accountId}/cfd_tunnel/${t.cfTunnelId}/configurations`, ingressFor(t));
+  await cf(decrypt(t.apiToken), 'PUT', `/accounts/${t.accountId}/cfd_tunnel/${t.cfTunnelId}/configurations`, ingressFor(t), 'tunnel');
 }
 
 // ---------------------------------------------------------------- access helpers
@@ -116,7 +133,10 @@ function out(t) {
     createdAt: t.createdAt,
     routes: (t.routes || []).map((r) => {
       const s = sites.find((x) => x.id === r.siteId);
-      return { id: r.id, hostname: r.hostname, siteId: r.siteId, siteName: s ? s.name : '(deleted)', siteSlug: s ? s.slug : '', zoneName: r.zoneName || '' };
+      return {
+        id: r.id, hostname: r.hostname, siteId: r.siteId, siteName: s ? s.name : '(deleted)', siteSlug: s ? s.slug : '', zoneName: r.zoneName || '',
+        dnsManual: !!r.dnsManual, dnsTarget: t.cfTunnelId ? `${t.cfTunnelId}.cfargotunnel.com` : '',
+      };
     }),
   };
 }
@@ -164,11 +184,11 @@ async function create(user, body) {
     const acct = accounts.find((a) => a.id === accountId);
     if (!acct) throw httpError(400, 'That account is not accessible with this token');
     const tunnelName = `pagemaster-${name.toLowerCase().replace(/[^a-z0-9-]+/g, '-')}-${t.id.slice(0, 6)}`;
-    const created = await cf(apiToken, 'POST', `/accounts/${accountId}/cfd_tunnel`, { name: tunnelName, config_src: 'cloudflare' });
+    const created = await cf(apiToken, 'POST', `/accounts/${accountId}/cfd_tunnel`, { name: tunnelName, config_src: 'cloudflare' }, 'tunnel');
     const cfTunnelId = created.result.id;
     let token;
     try {
-      token = (await cf(apiToken, 'GET', `/accounts/${accountId}/cfd_tunnel/${cfTunnelId}/token`)).result;
+      token = (await cf(apiToken, 'GET', `/accounts/${accountId}/cfd_tunnel/${cfTunnelId}/token`, undefined, 'tunnel')).result;
     } catch (e) {
       await cf(apiToken, 'DELETE', `/accounts/${accountId}/cfd_tunnel/${cfTunnelId}`).catch(() => {});
       throw e;
@@ -195,10 +215,10 @@ async function destroy(t) {
     const token = decrypt(t.apiToken);
     for (const r of t.routes || []) {
       if (!r.dnsRecordId) continue;
-      try { await cf(token, 'DELETE', `/zones/${r.zoneId}/dns_records/${r.dnsRecordId}`); } catch (e) { warnings.push(`DNS ${r.hostname}: ${e.message}`); }
+      try { await cf(token, 'DELETE', `/zones/${r.zoneId}/dns_records/${r.dnsRecordId}`, undefined, 'dns'); } catch (e) { warnings.push(`DNS ${r.hostname}: ${e.message}`); }
     }
     try { await cf(token, 'DELETE', `/accounts/${t.accountId}/cfd_tunnel/${t.cfTunnelId}/connections`); } catch (_) { /* may have none */ }
-    try { await cf(token, 'DELETE', `/accounts/${t.accountId}/cfd_tunnel/${t.cfTunnelId}`); } catch (e) { warnings.push(`Tunnel: ${e.message}`); }
+    try { await cf(token, 'DELETE', `/accounts/${t.accountId}/cfd_tunnel/${t.cfTunnelId}`, undefined, 'tunnel'); } catch (e) { warnings.push(`Tunnel: ${e.message}`); }
   }
   const d = db();
   d.tunnels = d.tunnels.filter((x) => x.id !== t.id);
@@ -215,7 +235,14 @@ async function addRoute(user, tunnelId, body) {
 
   if (t.mode === 'api') {
     const token = decrypt(t.apiToken);
-    const zone = (await cf(token, 'GET', `/zones/${encodeURIComponent(String(body.zoneId || ''))}`)).result;
+    const zoneId = String(body.zoneId || '');
+    let zone;
+    try {
+      zone = (await cf(token, 'GET', `/zones/${encodeURIComponent(zoneId)}`, undefined, 'zones')).result;
+    } catch (e) {
+      if (!e.cfAuth) throw e;
+      zone = (await listZones(t)).find((z) => z.id === zoneId);
+    }
     if (!zone || (zone.account && zone.account.id !== t.accountId)) throw httpError(400, 'Choose a domain (zone) from this Cloudflare account');
     const sub = String(body.subdomain ?? '').trim().toLowerCase().replace(/\.+$/, '');
     if (sub && !SUB_RE.test(sub)) throw httpError(400, 'Subdomain: letters, numbers, dashes (e.g. "blog" or "app.dev")');
@@ -229,35 +256,89 @@ async function addRoute(user, tunnelId, body) {
   const owner = hostnameOwner(route.hostname);
   if (owner) throw httpError(409, `${route.hostname} is already used by ${owner}`);
 
+  let warning = null;
   if (t.mode === 'api') {
-    const token = decrypt(t.apiToken);
-    const target = `${t.cfTunnelId}.cfargotunnel.com`;
-    const existing = (await cf(token, 'GET', `/zones/${route.zoneId}/dns_records?name=${encodeURIComponent(route.hostname)}`)).result || [];
+    const dns = await ensureDns(t, route);
+    t.routes = [...(t.routes || []), route];
+    try {
+      await pushIngress(t);
+    } catch (e) {
+      t.routes = t.routes.filter((r) => r.id !== route.id);
+      if (dns.created) await cf(decrypt(t.apiToken), 'DELETE', `/zones/${route.zoneId}/dns_records/${route.dnsRecordId}`, undefined, 'dns').catch(() => {});
+      throw e;
+    }
+    if (!dns.ok) warning = manualDnsWarning(t, route, dns.error);
+  } else {
+    t.routes = [...(t.routes || []), route];
+  }
+  save();
+  const o = out(t);
+  if (warning) o.warning = warning;
+  return o;
+}
+
+function dnsTarget(t) { return `${t.cfTunnelId}.cfargotunnel.com`; }
+
+function manualDnsWarning(t, r, error) {
+  return {
+    message: `${r.hostname} is published on the tunnel, but Pagemaster could not create its DNS record. ${error}`,
+    record: { type: 'CNAME', name: r.hostname, target: dnsTarget(t), proxied: true },
+  };
+}
+
+// Make sure the hostname has a proxied CNAME to the tunnel.
+// Permission problems don't fail the publish: the route is marked dnsManual and the
+// user is shown the record to add by hand (or can fix the token and retry).
+async function ensureDns(t, route) {
+  const token = decrypt(t.apiToken);
+  const target = dnsTarget(t);
+  try {
+    const existing = (await cf(token, 'GET', `/zones/${route.zoneId}/dns_records?name=${encodeURIComponent(route.hostname)}`, undefined, 'dns')).result || [];
     const clash = existing.find((r) => !(r.type === 'CNAME' && r.content === target));
     if (clash) {
       throw httpError(409, `Cloudflare already has a ${clash.type} record for ${route.hostname} (${clash.content}). Delete it in Cloudflare or pick another subdomain.`);
     }
     if (existing.length) {
       route.dnsRecordId = existing[0].id;
-    } else {
-      const rec = await cf(token, 'POST', `/zones/${route.zoneId}/dns_records`, {
-        type: 'CNAME', name: route.hostname, content: target, proxied: true, ttl: 1, comment: 'Managed by Pagemaster',
-      });
-      route.dnsRecordId = rec.result.id;
+      delete route.dnsManual;
+      return { ok: true, created: false };
     }
-    t.routes = [...(t.routes || []), route];
+    const rec = await cf(token, 'POST', `/zones/${route.zoneId}/dns_records`, {
+      type: 'CNAME', name: route.hostname, content: target, proxied: true, ttl: 1, comment: 'Managed by Pagemaster',
+    }, 'dns');
+    route.dnsRecordId = rec.result.id;
+    delete route.dnsManual;
+    return { ok: true, created: true };
+  } catch (e) {
+    if (!e.cfAuth) throw e;
+    route.dnsManual = true;
+    return { ok: false, error: e.message };
+  }
+}
+
+// Replace the API token of an API-mode tunnel (e.g. to add the DNS permission),
+// then retry anything that previously failed for lack of permission.
+async function updateToken(user, tunnelId, apiToken) {
+  const t = get(user, tunnelId);
+  if (t.mode !== 'api') throw httpError(400, 'This tunnel uses a tunnel token, not an API token');
+  apiToken = String(apiToken || '').trim();
+  const { accounts } = await inspectToken(apiToken);
+  if (!accounts.some((a) => a.id === t.accountId)) throw httpError(400, `The new token can't access the account "${t.accountName}" this tunnel belongs to`);
+  t.apiToken = encrypt(apiToken);
+  save();
+  const warnings = [];
+  try { await pushIngress(t); } catch (e) { warnings.push(e.message); }
+  for (const r of t.routes || []) {
+    if (!r.dnsManual) continue;
     try {
-      await pushIngress(t);
-    } catch (e) {
-      t.routes = t.routes.filter((r) => r.id !== route.id);
-      if (!existing.length) await cf(token, 'DELETE', `/zones/${route.zoneId}/dns_records/${route.dnsRecordId}`).catch(() => {});
-      throw e;
-    }
-  } else {
-    t.routes = [...(t.routes || []), route];
+      const d = await ensureDns(t, r);
+      if (!d.ok) warnings.push(`${r.hostname}: ${d.error}`);
+    } catch (e) { warnings.push(`${r.hostname}: ${e.message}`); }
   }
   save();
-  return out(t);
+  const o = out(t);
+  o.warnings = warnings;
+  return o;
 }
 
 async function removeRoute(user, tunnelId, routeId) {
@@ -276,7 +357,7 @@ async function dropRoute(t, r) {
     const token = decrypt(t.apiToken);
     try { await pushIngress(t); } catch (e) { warnings.push(e.message); }
     if (r.dnsRecordId) {
-      try { await cf(token, 'DELETE', `/zones/${r.zoneId}/dns_records/${r.dnsRecordId}`); } catch (e) { warnings.push(e.message); }
+      try { await cf(token, 'DELETE', `/zones/${r.zoneId}/dns_records/${r.dnsRecordId}`, undefined, 'dns'); } catch (e) { warnings.push(e.message); }
     }
   }
   return warnings;
@@ -402,5 +483,5 @@ async function shutdown() {
 
 module.exports = {
   inspectToken, listZones, list, get, create, remove, addRoute, removeRoute,
-  removeSiteRoutes, removeUserTunnels, setEnabled, readLog, startAll, shutdown, hostnameOwner,
+  removeSiteRoutes, removeUserTunnels, updateToken, setEnabled, readLog, startAll, shutdown, hostnameOwner,
 };

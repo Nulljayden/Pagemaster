@@ -174,7 +174,9 @@ Each user with the `tunnels.manage` permission can connect **their own** Cloudfl
    - Zone → **DNS** → Edit
    - Zone → **Zone** → Read
 
-   Under *Zone Resources*, pick the domains you want to use.
+   Under *Zone Resources*, pick **Include → All zones** (or your domain). DNS is a **Zone** permission: picking "all permissions" in the Account section does **not** include it. Without it you get `Authentication error (10000)` when publishing.
+
+   If your token is missing DNS permission, Pagemaster still publishes the site and shows the exact `CNAME` record to add by hand. You can also fix the token and use **Update API token** on the tunnel; Pagemaster then creates any missing DNS records itself.
 2. In Pagemaster, go to **Tunnels → + Connect Cloudflare**, paste the token, click **Check token**, pick the account, then **Create tunnel**.
 3. Click **+ Publish a site**, pick the site, a subdomain (defaults to the slug) and the domain. Pagemaster adds the tunnel's public hostname and a proxied `CNAME` record. The site is live at `https://<sub>.<domain>` within a minute.
 
